@@ -1,0 +1,6 @@
+qbittorrent-api
+paramiko
+requests
+python-dotenv
+pytz
+tabulate

@@ -1,0 +1,11 @@
+.env
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+torrent_file_backup/
+torrent_file_backup.json
+state.json
+*.log
+.venv/
+venv/

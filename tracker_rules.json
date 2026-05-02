@@ -1,0 +1,14 @@
+[
+  {
+    "displayedName": "TorrentLeech",
+    "category": "tl",
+    "min_seed_time": 11,
+    "min_seed_unit": "days"
+  },
+  {
+    "displayedName": "IPTorrents",
+    "category": "ipt",
+    "min_seed_time": 15,
+    "min_seed_unit": "days"
+  }
+]
