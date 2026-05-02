@@ -35,8 +35,8 @@ The script runs in an infinite loop and rechecks every 5 minutes.
 ### 1. Clone and install dependencies
 
 ```bash
-git clone https://github.com/ThatProgrammerr/seedbox_torrent_manager.git
-cd seedbox_torrent_manager
+git clone https://github.com/ThatProgrammerr/seedbox-torrent-manager.git
+cd seedbox-torrent-manager
 pip install -r requirements.txt
 ```
 
