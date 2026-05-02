@@ -1,4 +1,4 @@
-# torrent-cleanup
+# seedbox-torrent-manager
 
 An automated qBittorrent cleanup daemon for [UltraSeedbox](https://ultra.cc/) that keeps your storage healthy by removing low-value torrents, clearing unregistered torrents, and enforcing tracker-specific seeding rules.
 
@@ -177,8 +177,8 @@ Then:
 
 ```bash
 sudo systemctl daemon-reload
-sudo systemctl enable torrent-cleanup
-sudo systemctl start torrent-cleanup
+sudo systemctl enable seedbox-torrent-manager
+sudo systemctl start seedbox-torrent-manager
 ```
 
 ---
