@@ -116,7 +116,7 @@ def convert_hours_pretty(total_hours):
 
 def formatted_duration(last_activity_epoch):
     tz = pytz.timezone(TIMEZONE)
-    current_tz_dt = datetime.utcnow().replace(tzinfo=pytz.utc).astimezone(tz)
+    current_tz_dt = datetime.now(timezone.utc).astimezone(tz)
     last_activity_dt = datetime.fromtimestamp(last_activity_epoch, tz)
     duration_seconds = int((current_tz_dt - last_activity_dt).total_seconds())
 
@@ -138,7 +138,7 @@ def formatted_duration(last_activity_epoch):
 
 def timestamp_seconds(last_activity_epoch):
     tz = pytz.timezone(TIMEZONE)
-    current_tz_dt = datetime.utcnow().replace(tzinfo=pytz.utc).astimezone(tz)
+    current_tz_dt = datetime.now(timezone.utc).astimezone(tz)
     last_activity_dt = datetime.fromtimestamp(last_activity_epoch, tz)
     return int((current_tz_dt - last_activity_dt).total_seconds())
 
@@ -244,14 +244,15 @@ def convert_speed(bps):
     kb = 1024
     mb = kb * 1024
     gb = mb * 1024
+    tb = gb * 1024
 
     if bps < kb:
         return f"{bps:.2f} B/s"
-    elif bps < kb ** 2:
-        return f"{bps / kb:.2f} KB/s"
     elif bps < mb:
-        return f"{bps / (kb ** 2):.2f} MB/s"
+        return f"{bps / kb:.2f} KB/s"
     elif bps < gb:
-        return f"{bps / mb:.2f} GB/s"
+        return f"{bps / mb:.2f} MB/s"
+    elif bps < tb:
+        return f"{bps / gb:.2f} GB/s"
     else:
-        return f"{bps / gb:.2f} TB/s"
+        return f"{bps / tb:.2f} TB/s"

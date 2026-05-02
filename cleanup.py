@@ -114,8 +114,6 @@ def validate_config():
         "QB_HOST":      os.getenv("QB_HOST"),
         "QB_USERNAME":  os.getenv("QB_USERNAME"),
         "QB_PASSWORD":  os.getenv("QB_PASSWORD"),
-        "API_URL":      os.getenv("API_URL"),
-        "BEARER_TOKEN": os.getenv("BEARER_TOKEN"),
     }
 
     missing = [key for key, value in required.items() if not value]
@@ -452,9 +450,9 @@ def cleanup_torrents(qb_client, free_storage_gb):
     ]
     candidates = sorted(
         candidates,
-        key=lambda t: (-t.popularity, (timestamp_seconds(t.last_activity), timestamp_seconds(t.added_on)))
+        key=lambda t: (-t.popularity, (timestamp_seconds(t.last_activity), timestamp_seconds(t.added_on))),
+        reverse=True,
     )
-    candidates.reverse()
 
     freed_space = 0
     deletions = 0
@@ -610,9 +608,9 @@ def send_next_torrents_to_delete_webhook(qb_client):
         and (t.category or "").lower() != "keep"
     ]
     candidates.sort(
-        key=lambda x: (-x.popularity, (timestamp_seconds(x.last_activity), timestamp_seconds(x.added_on)))
+        key=lambda x: (-x.popularity, (timestamp_seconds(x.last_activity), timestamp_seconds(x.added_on))),
+        reverse=True,
     )
-    candidates.reverse()
 
     table = [["Name", "Size", "Ratio", "Fame", "Speed", "Seeding Time", "Added", "Activity", "Category"]]
     for t in candidates:
