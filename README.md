@@ -51,7 +51,7 @@ Edit `.env` with your values. At minimum you need the qBittorrent credentials. E
 ### 3. Run
 
 ```bash
-python cleanup.py
+python3 cleanup.py
 ```
 
 ---
@@ -154,18 +154,18 @@ After accepting the host key interactively, the script will connect without issu
 
 ## Running as a systemd service
 
-Create `/etc/systemd/system/torrent-cleanup.service`:
+Create `/etc/systemd/system/seedbox-torrent-manager.service`:
 
 ```ini
 [Unit]
-Description=Torrent Cleanup Daemon
+Description=Seedbox Torrent Manager
 After=network.target
 
 [Service]
 Type=simple
 User=YOUR_USER
-WorkingDirectory=/path/to/torrent-cleanup
-ExecStart=/usr/bin/python3 /path/to/torrent-cleanup/cleanup.py
+WorkingDirectory=/path/to/seedbox-torrent-manager
+ExecStart=/usr/bin/python3 /path/to/seedbox-torrent-manager/cleanup.py
 Restart=on-failure
 RestartSec=30
 
