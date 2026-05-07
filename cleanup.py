@@ -366,7 +366,7 @@ def check_storage_mismatch():
     if not storage_data:
         return
 
-    used_storage_gb = storage_data["service_stats_info"]["used_storage_value"]
+    used_storage_gb = storage_data["service_stats_info"]["used_storage_value"] / 1024
     qb_client = get_qbittorrent_client()
     if not qb_client:
         return
