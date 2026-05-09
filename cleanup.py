@@ -3,6 +3,7 @@ import sys
 import time
 import logging
 import json
+import subprocess
 
 from pathlib import Path
 from dotenv import load_dotenv
@@ -44,6 +45,8 @@ COMMANDS_WHEN_LIMIT_HIT = os.getenv("COMMAND_LIMIT_HIT")
 COMMANDS_WHEN_LIMIT_REFRESHED = os.getenv("COMMAND_LIMIT_REFRESHED")
 
 SSH_CONFIGURED = bool(SSH_SERVER and SSH_USERNAME and SSH_KEY)
+
+RUNNING_ON_SERVER = os.getenv("RUNNING_ON_SERVER", "false").lower() in ("true", "1", "yes")
 
 # ----------------------------------
 # Cleanup thresholds
@@ -134,35 +137,48 @@ def warn_optional_config():
     Logs a clear warning for each optional feature that is not configured,
     describing exactly what will not work as a result.
     """
-    # SSH credentials
-    ssh_vars_missing = [k for k, v in {"SSH_SERVER": SSH_SERVER, "SSH_USERNAME": SSH_USERNAME, "SSH_KEY": SSH_KEY}.items() if not v]
-    if ssh_vars_missing:
-        logger.warning(
-            f"SSH is not configured ({', '.join(ssh_vars_missing)} not set). "
-            "The following automated actions are disabled:"
-        )
-        logger.warning("  - Stopping AutoBRR (the app that adds new torrents to qBittorrent) when the monthly traffic limit is reached")
-        logger.warning("  - Stopping AutoBRR when storage drops below the minimum threshold")
-        logger.warning("  - Restarting AutoBRR when traffic or storage recovers")
-        logger.warning(
-            "  *** IMPORTANT: Without SSH configured, AutoBRR will continue adding new torrents even when "
-            "your storage is full or your monthly traffic quota is exhausted. This will cause your disk to "
-            "fill up completely, prevent any upload credit from being earned, and may cause errors on your "
-            "seedbox. It is strongly recommended to configure SSH unless your storage is very large. ***"
-        )
-        logger.warning("  Set SSH_SERVER, SSH_USERNAME, and SSH_KEY in your .env to enable these.")
-    else:
-        # SSH is present — check the commands themselves
+    if RUNNING_ON_SERVER:
+        # In server mode SSH is not used — only warn about missing commands
         if not COMMANDS_WHEN_LIMIT_HIT:
             logger.warning(
-                "COMMAND_LIMIT_HIT is not set. No SSH command will run when the traffic or storage "
+                "COMMAND_LIMIT_HIT is not set. No command will run when the traffic or storage "
                 "limit is reached (AutoBRR will keep adding new torrents)."
             )
         if not COMMANDS_WHEN_LIMIT_REFRESHED:
             logger.warning(
-                "COMMAND_LIMIT_REFRESHED is not set. No SSH command will run when traffic or storage "
+                "COMMAND_LIMIT_REFRESHED is not set. No command will run when traffic or storage "
                 "recovers (AutoBRR will not be automatically restarted)."
             )
+    else:
+        # SSH credentials
+        ssh_vars_missing = [k for k, v in {"SSH_SERVER": SSH_SERVER, "SSH_USERNAME": SSH_USERNAME, "SSH_KEY": SSH_KEY}.items() if not v]
+        if ssh_vars_missing:
+            logger.warning(
+                f"SSH is not configured ({', '.join(ssh_vars_missing)} not set). "
+                "The following automated actions are disabled:"
+            )
+            logger.warning("  - Stopping AutoBRR (the app that adds new torrents to qBittorrent) when the monthly traffic limit is reached")
+            logger.warning("  - Stopping AutoBRR when storage drops below the minimum threshold")
+            logger.warning("  - Restarting AutoBRR when traffic or storage recovers")
+            logger.warning(
+                "  *** IMPORTANT: Without SSH configured, AutoBRR will continue adding new torrents even when "
+                "your storage is full or your monthly traffic quota is exhausted. This will cause your disk to "
+                "fill up completely, prevent any upload credit from being earned, and may cause errors on your "
+                "seedbox. It is strongly recommended to configure SSH unless your storage is very large. ***"
+            )
+            logger.warning("  Set SSH_SERVER, SSH_USERNAME, and SSH_KEY in your .env to enable these.")
+        else:
+            # SSH is present — check the commands themselves
+            if not COMMANDS_WHEN_LIMIT_HIT:
+                logger.warning(
+                    "COMMAND_LIMIT_HIT is not set. No SSH command will run when the traffic or storage "
+                    "limit is reached (AutoBRR will keep adding new torrents)."
+                )
+            if not COMMANDS_WHEN_LIMIT_REFRESHED:
+                logger.warning(
+                    "COMMAND_LIMIT_REFRESHED is not set. No SSH command will run when traffic or storage "
+                    "recovers (AutoBRR will not be automatically restarted)."
+                )
 
     # Discord — general webhook
     if not os.getenv("DISCORD_WEBHOOK_URL"):
@@ -187,6 +203,30 @@ def warn_optional_config():
             "UNREGISTERED_CHECK_ENABLED is false. Torrents that trackers have marked as "
             "'unregistered' will not be automatically removed."
         )
+
+
+def validate_server_mode():
+    """
+    Validates that the local system commands required by RUNNING_ON_SERVER mode are available.
+    Exits with a clear error if either command fails.
+    """
+    errors = []
+
+    result = subprocess.run(["quota", "-s"], capture_output=True, text=True, timeout=10)
+    if result.returncode != 0:
+        errors.append("'quota -s' failed — is quota installed and configured for this user?")
+
+    result = subprocess.run(["app-traffic", "info"], capture_output=True, text=True, timeout=10)
+    if result.returncode != 0:
+        errors.append("'app-traffic info' failed — is this command available on your system?")
+
+    if errors:
+        logger.error("RUNNING_ON_SERVER=true is set but required system commands are not working:")
+        for err in errors:
+            logger.error(f"  {err}")
+        sys.exit(1)
+
+    logger.info("Server mode validated: quota and app-traffic commands are available.")
 
 
 def load_tracker_rules():
@@ -294,6 +334,45 @@ def _get_ssh_client():
     return create_ssh_client(SSH_SERVER, SSH_PORT, SSH_USERNAME, SSH_KEY)
 
 
+def run_command_local(command):
+    """
+    Run a shell command locally. Exits the program if the command fails.
+    Used in RUNNING_ON_SERVER mode where command failure is unrecoverable.
+    """
+    if not command:
+        return
+    try:
+        result = subprocess.run(command, shell=True, capture_output=True, text=True, timeout=30)
+        if result.returncode != 0:
+            logger.error(f"Local command failed (exit {result.returncode}): {command!r}")
+            if result.stdout.strip():
+                logger.error(f"  stdout: {result.stdout.strip()}")
+            if result.stderr.strip():
+                logger.error(f"  stderr: {result.stderr.strip()}")
+            sys.exit(1)
+        if result.stdout.strip():
+            logger.info(result.stdout.strip())
+    except Exception as e:
+        logger.error(f"Error running local command {command!r}: {e}")
+        sys.exit(1)
+
+
+def run_limit_command(command):
+    """
+    Run a limit/recovery command (e.g. stop or start autobrr).
+    Runs locally if RUNNING_ON_SERVER=true, otherwise executes over SSH.
+    """
+    if not command:
+        return
+    if RUNNING_ON_SERVER:
+        run_command_local(command)
+    else:
+        ssh_client = _get_ssh_client()
+        if ssh_client:
+            run_ssh_command(ssh_client, command)
+            ssh_client.close()
+
+
 # ----------------------------------
 # Traffic and storage checks
 # ----------------------------------
@@ -317,11 +396,8 @@ def manage_traffic_based_ssh_commands(status_update=False):
         traffic_used_percentage = 0
 
     if traffic_used_percentage >= TRAFFIC_LIMIT_THRESHOLD and not BANDWIDTH_COMMANDS_RAN:
-        logger.info(f"Traffic at {traffic_used_percentage}% — limit reached. Running SSH command.")
-        ssh_client = _get_ssh_client()
-        if ssh_client:
-            run_ssh_command(ssh_client, COMMANDS_WHEN_LIMIT_HIT)
-            ssh_client.close()
+        logger.info(f"Traffic at {traffic_used_percentage}% — limit reached. Running stop command.")
+        run_limit_command(COMMANDS_WHEN_LIMIT_HIT)
         BANDWIDTH_COMMANDS_RAN = True
         write_state({**read_state(), "bandwidth_commands_ran": True})
         send_discord_message(
@@ -331,11 +407,8 @@ def manage_traffic_based_ssh_commands(status_update=False):
         )
 
     elif traffic_used_percentage < 10 and BANDWIDTH_COMMANDS_RAN:
-        logger.info("Traffic reset. Running SSH recovery command.")
-        ssh_client = _get_ssh_client()
-        if ssh_client:
-            run_ssh_command(ssh_client, COMMANDS_WHEN_LIMIT_REFRESHED)
-            ssh_client.close()
+        logger.info("Traffic reset. Running recovery command.")
+        run_limit_command(COMMANDS_WHEN_LIMIT_REFRESHED)
         BANDWIDTH_COMMANDS_RAN = False
         write_state({**read_state(), "bandwidth_commands_ran": False})
         send_discord_message(
@@ -424,16 +497,13 @@ def cleanup_torrents(qb_client, free_storage_gb):
     logger.info(f"Running storage-based cleanup. Free: {free_storage_gb:.2f} GB, minimum: {MIN_FREE_GB} GB.")
 
     if free_storage_gb < MIN_FREE_GB and not STORAGE_COMMANDS_RAN and not BANDWIDTH_COMMANDS_RAN:
-        logger.error("Storage below threshold. Running SSH safety command.")
+        logger.error("Storage below threshold. Running stop command.")
         send_discord_message(
             title="Critical Storage Alert",
-            description="Storage below threshold. Running SSH safety command.",
+            description="Storage below threshold. Running stop command.",
             color=Colors.RED
         )
-        ssh_client = _get_ssh_client()
-        if ssh_client:
-            run_ssh_command(ssh_client, COMMANDS_WHEN_LIMIT_HIT)
-            ssh_client.close()
+        run_limit_command(COMMANDS_WHEN_LIMIT_HIT)
         STORAGE_COMMANDS_RAN = True
         write_state({**read_state(), "storage_commands_ran": True})
         send_discord_message(
@@ -681,6 +751,9 @@ def main():
     tracker_rules = load_tracker_rules()
     display_tracker_rules(tracker_rules)
 
+    if RUNNING_ON_SERVER:
+        validate_server_mode()
+
     logger.info("Starting torrent cleanup script...")
     state = read_state()
     BANDWIDTH_COMMANDS_RAN = state["bandwidth_commands_ran"]
@@ -701,11 +774,8 @@ def main():
         storage_data = get_storage_data()
         if storage_data:
             if API_DOWN_COMMANDS_RAN:
-                logger.info("Ultra API recovered. Running SSH recovery command.")
-                ssh_client = _get_ssh_client()
-                if ssh_client:
-                    run_ssh_command(ssh_client, COMMANDS_WHEN_LIMIT_REFRESHED)
-                    ssh_client.close()
+                logger.info("Ultra API recovered. Running recovery command.")
+                run_limit_command(COMMANDS_WHEN_LIMIT_REFRESHED)
                 API_DOWN_COMMANDS_RAN = False
                 write_state({**read_state(), "api_down_commands_ran": False})
                 send_discord_message(
@@ -717,11 +787,8 @@ def main():
             free_storage_gb = storage_data["service_stats_info"]["free_storage_gb"]
 
             if free_storage_gb > MIN_FREE_GB and STORAGE_COMMANDS_RAN and not BANDWIDTH_COMMANDS_RAN:
-                logger.info("Storage recovered. Running SSH recovery command.")
-                ssh_client = _get_ssh_client()
-                if ssh_client:
-                    run_ssh_command(ssh_client, COMMANDS_WHEN_LIMIT_REFRESHED)
-                    ssh_client.close()
+                logger.info("Storage recovered. Running recovery command.")
+                run_limit_command(COMMANDS_WHEN_LIMIT_REFRESHED)
                 STORAGE_COMMANDS_RAN = False
                 write_state({**read_state(), "storage_commands_ran": False})
                 send_discord_message(
@@ -741,11 +808,8 @@ def main():
         else:
             logger.warning("Storage data unavailable. Skipping storage-based cleanup this cycle.")
             if not API_DOWN_COMMANDS_RAN:
-                logger.warning("Ultra API is down. Running SSH stop command to prevent quota overrun.")
-                ssh_client = _get_ssh_client()
-                if ssh_client:
-                    run_ssh_command(ssh_client, COMMANDS_WHEN_LIMIT_HIT)
-                    ssh_client.close()
+                logger.warning("Ultra API is down. Running stop command to prevent quota overrun.")
+                run_limit_command(COMMANDS_WHEN_LIMIT_HIT)
                 API_DOWN_COMMANDS_RAN = True
                 write_state({**read_state(), "api_down_commands_ran": True})
                 send_discord_message(
