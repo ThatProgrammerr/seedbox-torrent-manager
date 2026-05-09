@@ -66,7 +66,7 @@ def get_storage_data_local():
         )
         traffic_available_pct = None
         for line in traffic_result.stdout.splitlines():
-            if "traffic available percentage" in line.lower():
+            if "traffic available:" in line.lower():
                 parts = line.split(":", 1)
                 if len(parts) == 2:
                     traffic_available_pct = float(parts[1].strip().rstrip('%'))
