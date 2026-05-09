@@ -67,6 +67,7 @@ STATE_FILE = Path(__file__).parent / "state.json"
 _DEFAULT_STATE = {
     "bandwidth_commands_ran": False,
     "storage_commands_ran": False,
+    "api_down_commands_ran": False,
 }
 
 def read_state():
@@ -89,6 +90,7 @@ def write_state(state):
 
 BANDWIDTH_COMMANDS_RAN = False
 STORAGE_COMMANDS_RAN = False
+API_DOWN_COMMANDS_RAN = False
 
 # ----------------------------------
 # Tracker rule time units
@@ -672,7 +674,7 @@ def save_torrent_files(qb_client):
 # ----------------------------------
 
 def main():
-    global BANDWIDTH_COMMANDS_RAN, STORAGE_COMMANDS_RAN
+    global BANDWIDTH_COMMANDS_RAN, STORAGE_COMMANDS_RAN, API_DOWN_COMMANDS_RAN
 
     validate_config()
     warn_optional_config()
@@ -683,6 +685,7 @@ def main():
     state = read_state()
     BANDWIDTH_COMMANDS_RAN = state["bandwidth_commands_ran"]
     STORAGE_COMMANDS_RAN = state["storage_commands_ran"]
+    API_DOWN_COMMANDS_RAN = state["api_down_commands_ran"]
 
     send_hourly_storage_update()
     check_storage_mismatch()
@@ -697,6 +700,20 @@ def main():
         # Storage-based cleanup
         storage_data = get_storage_data()
         if storage_data:
+            if API_DOWN_COMMANDS_RAN:
+                logger.info("Ultra API recovered. Running SSH recovery command.")
+                ssh_client = _get_ssh_client()
+                if ssh_client:
+                    run_ssh_command(ssh_client, COMMANDS_WHEN_LIMIT_REFRESHED)
+                    ssh_client.close()
+                API_DOWN_COMMANDS_RAN = False
+                write_state({**read_state(), "api_down_commands_ran": False})
+                send_discord_message(
+                    title="Ultra API Recovered",
+                    description="The Ultra API is back online. autobrr has been restarted.",
+                    color=Colors.LIME
+                )
+
             free_storage_gb = storage_data["service_stats_info"]["free_storage_gb"]
 
             if free_storage_gb > MIN_FREE_GB and STORAGE_COMMANDS_RAN and not BANDWIDTH_COMMANDS_RAN:
@@ -723,6 +740,19 @@ def main():
                 )
         else:
             logger.warning("Storage data unavailable. Skipping storage-based cleanup this cycle.")
+            if not API_DOWN_COMMANDS_RAN:
+                logger.warning("Ultra API is down. Running SSH stop command to prevent quota overrun.")
+                ssh_client = _get_ssh_client()
+                if ssh_client:
+                    run_ssh_command(ssh_client, COMMANDS_WHEN_LIMIT_HIT)
+                    ssh_client.close()
+                API_DOWN_COMMANDS_RAN = True
+                write_state({**read_state(), "api_down_commands_ran": True})
+                send_discord_message(
+                    title="Ultra API Unreachable",
+                    description="The Ultra API is not responding. autobrr has been stopped to prevent quota overrun.",
+                    color=Colors.RED
+                )
 
         if qb_client:
             cleanup_unregistered_torrents(qb_client)
