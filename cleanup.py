@@ -642,7 +642,12 @@ def save_torrent_files(qb_client):
     torrent_index = {}
     if index_path.exists():
         with open(index_path) as f:
-            torrent_index = json.load(f)
+            try:
+                torrent_index = json.load(f)
+            except json.JSONDecodeError:
+                corrupted_path = index_path.with_suffix(".corrupted")
+                index_path.rename(corrupted_path)
+                logger.warning(f"Corrupted torrent index renamed to {corrupted_path}, starting fresh.")
 
     existing_hashes = {p.stem for p in backup_dir.glob("*.torrent")}
 
