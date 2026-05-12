@@ -107,6 +107,34 @@ UNIT_TO_SECONDS = {
 
 
 # ----------------------------------
+# Discord message helpers
+# ----------------------------------
+
+def _stop_description():
+    """Returns a past-tense sentence describing what the stop command did."""
+    cmd = COMMANDS_WHEN_LIMIT_HIT or ""
+    if "autobrr" in cmd.lower():
+        return "autobrr has been stopped to prevent new torrents from being added"
+    return "the stop command has been executed to prevent new torrents from being added"
+
+
+def _start_description():
+    """Returns a past-tense sentence describing what the recovery command did."""
+    cmd = COMMANDS_WHEN_LIMIT_REFRESHED or ""
+    if "autobrr" in cmd.lower():
+        return "autobrr has been restarted and will resume adding new torrents"
+    return "the recovery command has been executed"
+
+
+def _still_stopped_description():
+    """Returns a present-tense phrase describing the ongoing stopped state."""
+    cmd = COMMANDS_WHEN_LIMIT_HIT or ""
+    if "autobrr" in cmd.lower():
+        return "autobrr remains stopped"
+    return "the stop command has already run"
+
+
+# ----------------------------------
 # Startup validation
 # ----------------------------------
 
@@ -402,7 +430,10 @@ def manage_traffic_based_ssh_commands(status_update=False):
         write_state({**read_state(), "bandwidth_commands_ran": True})
         send_discord_message(
             title="Traffic Limit Hit",
-            description=f"Traffic at {traffic_used_percentage}%. Limit command executed.",
+            description=(
+                f"Monthly traffic usage is at {traffic_used_percentage}% (threshold: {TRAFFIC_LIMIT_THRESHOLD}%). "
+                f"{_stop_description().capitalize()} until traffic resets."
+            ),
             color=Colors.RED
         )
 
@@ -413,7 +444,7 @@ def manage_traffic_based_ssh_commands(status_update=False):
         write_state({**read_state(), "bandwidth_commands_ran": False})
         send_discord_message(
             title="Traffic Limit Refreshed",
-            description="Traffic has reset. Recovery command executed.",
+            description=f"Monthly traffic has reset. {_start_description().capitalize()}.",
             color=Colors.GREEN
         )
 
@@ -422,7 +453,7 @@ def manage_traffic_based_ssh_commands(status_update=False):
         if status_update:
             send_discord_message(
                 title="Traffic Update",
-                description=f"Traffic at {traffic_used_percentage}% (limit: {TRAFFIC_LIMIT_THRESHOLD}%).",
+                description=f"Traffic at {traffic_used_percentage}% (limit: {TRAFFIC_LIMIT_THRESHOLD}%). No action needed.",
                 color=Colors.GREENYELLOW
             )
 
@@ -431,7 +462,10 @@ def manage_traffic_based_ssh_commands(status_update=False):
         if status_update:
             send_discord_message(
                 title="Traffic Update",
-                description=f"Still at {traffic_used_percentage}%. Waiting for traffic reset.",
+                description=(
+                    f"Traffic still at {traffic_used_percentage}% (limit: {TRAFFIC_LIMIT_THRESHOLD}%). "
+                    f"{_still_stopped_description().capitalize()} — waiting for monthly traffic reset."
+                ),
                 color=Colors.FUCHSIA
             )
 
@@ -459,10 +493,10 @@ def check_storage_mismatch():
         send_discord_message(
             title="Storage Mismatch Warning",
             description=(
-                f"Reported: {used_storage_gb:.2f} GB\n"
-                f"Torrent data: {total_torrent_size_gb:.2f} GB\n"
-                f"Difference: {mismatch_gb:.2f} GB\n"
-                "Manual cleanup may be needed."
+                f"The storage API reports {used_storage_gb:.2f} GB used, but qBittorrent only accounts for "
+                f"{total_torrent_size_gb:.2f} GB — a gap of {mismatch_gb:.2f} GB.\n\n"
+                "This usually means non-torrent files (logs, media, partial downloads, etc.) are taking up significant space. "
+                "Manual cleanup of files outside qBittorrent may be needed."
             ),
             color=Colors.YELLOW
         )
@@ -474,7 +508,7 @@ def send_hourly_storage_update():
         free_gb = storage_data["service_stats_info"]["free_storage_gb"]
         send_discord_message(
             title="Hourly Storage Update",
-            description=f"Free storage: {free_gb:.2f} GB",
+            description=f"Free storage: {free_gb:.2f} GB (minimum threshold: {MIN_FREE_GB} GB)",
             color=Colors.LIME
         )
 
@@ -500,17 +534,15 @@ def cleanup_torrents(qb_client, free_storage_gb):
         logger.error("Storage below threshold. Running stop command.")
         send_discord_message(
             title="Critical Storage Alert",
-            description="Storage below threshold. Running stop command.",
+            description=(
+                f"Free storage has dropped below the {MIN_FREE_GB} GB minimum threshold. "
+                f"{_stop_description().capitalize()} while cleanup runs."
+            ),
             color=Colors.RED
         )
         run_limit_command(COMMANDS_WHEN_LIMIT_HIT)
         STORAGE_COMMANDS_RAN = True
         write_state({**read_state(), "storage_commands_ran": True})
-        send_discord_message(
-            title="Storage Safety Command Executed",
-            description="SSH command executed due to critically low storage.",
-            color=Colors.FUCHSIA
-        )
 
     candidates = [
         t for t in qb_client.torrents_info()
@@ -538,7 +570,11 @@ def cleanup_torrents(qb_client, free_storage_gb):
             logger.warning(f"Reached max deletions per run ({MAX_DELETIONS_PER_RUN}).")
             send_discord_message(
                 title="Cleanup Limit Reached",
-                description=f"Stopped after {MAX_DELETIONS_PER_RUN} deletions. Storage still below minimum.",
+                description=(
+                    f"Reached the {MAX_DELETIONS_PER_RUN} deletion limit for this cycle — this is a safety cap to avoid "
+                    "removing too many torrents at once. Storage is still below the minimum, but cleanup will "
+                    "re-evaluate and continue on the next cycle (every 5 minutes)."
+                ),
                 color=Colors.YELLOW
             )
             return
@@ -699,7 +735,13 @@ def send_next_torrents_to_delete_webhook(qb_client):
         ])
 
     send_discord_message(
-        description="**Next Scheduled Torrents**```\n\n" + tabulate(table, headers="firstrow", tablefmt="markdown") + "\n ```",
+        description=(
+            "**Next Scheduled Torrents**\n"
+            "Torrents most likely to be deleted first during the next storage cleanup, ordered by deletion priority "
+            "(lowest popularity + oldest activity first). All have ratio ≥ 1.0, are not actively uploading, "
+            "and are not in the 'keep' category. Nothing is deleted until free storage drops below the minimum threshold.\n"
+            "```\n\n" + tabulate(table, headers="firstrow", tablefmt="markdown") + "\n ```"
+        ),
         color=Colors.GRAY,
         send_raw=True
     )
@@ -780,7 +822,7 @@ def main():
                 write_state({**read_state(), "api_down_commands_ran": False})
                 send_discord_message(
                     title="Ultra API Recovered",
-                    description="The Ultra API is back online. autobrr has been restarted.",
+                    description=f"The Ultra API is back online. {_start_description().capitalize()} and storage/traffic monitoring has resumed.",
                     color=Colors.LIME
                 )
 
@@ -793,7 +835,7 @@ def main():
                 write_state({**read_state(), "storage_commands_ran": False})
                 send_discord_message(
                     title="Storage Recovered",
-                    description="Storage is back above minimum. Recovery command executed.",
+                    description=f"Free storage is back above {MIN_FREE_GB} GB. {_start_description().capitalize()}.",
                     color=Colors.LIME
                 )
 
@@ -802,7 +844,7 @@ def main():
             else:
                 send_discord_message(
                     title="qBittorrent Unreachable",
-                    description="Could not connect to qBittorrent for storage-based cleanup.",
+                    description="Could not connect to qBittorrent. Storage-based cleanup and torrent management will be skipped this cycle.",
                     color=Colors.RED
                 )
         else:
@@ -814,7 +856,11 @@ def main():
                 write_state({**read_state(), "api_down_commands_ran": True})
                 send_discord_message(
                     title="Ultra API Unreachable",
-                    description="The Ultra API is not responding. autobrr has been stopped to prevent quota overrun.",
+                    description=(
+                        "The Ultra API (used to check storage and traffic usage) is not responding. "
+                        f"{_stop_description().capitalize()} as a precaution to prevent quota overrun. "
+                        "Will retry each cycle and run the recovery command automatically when the API comes back."
+                    ),
                     color=Colors.RED
                 )
 
