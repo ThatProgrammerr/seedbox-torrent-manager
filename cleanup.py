@@ -9,6 +9,9 @@ from pathlib import Path
 from dotenv import load_dotenv
 from datetime import datetime, timezone
 from tabulate import tabulate
+from apscheduler.schedulers.blocking import BlockingScheduler
+from apscheduler.triggers.cron import CronTrigger
+from apscheduler.executors.pool import ThreadPoolExecutor
 
 from utilities import (
     Colors,
@@ -94,6 +97,7 @@ def write_state(state):
 BANDWIDTH_COMMANDS_RAN = False
 STORAGE_COMMANDS_RAN = False
 API_DOWN_COMMANDS_RAN = False
+_tracker_rules = []
 
 # ----------------------------------
 # Tracker rule time units
@@ -782,16 +786,117 @@ def save_torrent_files(qb_client):
 
 
 # ----------------------------------
-# Main loop
+# Scheduled jobs
+# ----------------------------------
+
+def _five_minute_job():
+    global BANDWIDTH_COMMANDS_RAN, STORAGE_COMMANDS_RAN, API_DOWN_COMMANDS_RAN
+
+    logger.info("Running periodic checks...")
+
+    qb_client = get_qbittorrent_client()
+
+    storage_data = get_storage_data()
+    if storage_data:
+        if API_DOWN_COMMANDS_RAN:
+            logger.info("Storage data recovered. Running recovery command.")
+            run_limit_command(COMMANDS_WHEN_LIMIT_REFRESHED)
+            API_DOWN_COMMANDS_RAN = False
+            write_state({**read_state(), "api_down_commands_ran": False})
+            if RUNNING_ON_SERVER:
+                send_discord_message(
+                    title="Storage Commands Recovered",
+                    description=f"Local storage commands are returning data again. {_start_description().capitalize()} and storage/traffic monitoring has resumed.",
+                    color=Colors.LIME
+                )
+            else:
+                send_discord_message(
+                    title="Ultra API Recovered",
+                    description=f"The Ultra API is back online. {_start_description().capitalize()} and storage/traffic monitoring has resumed.",
+                    color=Colors.LIME
+                )
+
+        free_storage_gb = storage_data["service_stats_info"]["free_storage_gb"]
+
+        if free_storage_gb > MIN_FREE_GB and STORAGE_COMMANDS_RAN and not BANDWIDTH_COMMANDS_RAN:
+            logger.info("Storage recovered. Running recovery command.")
+            run_limit_command(COMMANDS_WHEN_LIMIT_REFRESHED)
+            STORAGE_COMMANDS_RAN = False
+            write_state({**read_state(), "storage_commands_ran": False})
+            send_discord_message(
+                title="Storage Recovered",
+                description=f"Free storage is back above {MIN_FREE_GB} GB. {_start_description().capitalize()}.",
+                color=Colors.LIME
+            )
+
+        if qb_client:
+            cleanup_torrents(qb_client, free_storage_gb)
+        else:
+            send_discord_message(
+                title="qBittorrent Unreachable",
+                description="Could not connect to qBittorrent. Storage-based cleanup and torrent management will be skipped this cycle.",
+                color=Colors.RED
+            )
+    else:
+        logger.warning("Storage data unavailable. Skipping storage-based cleanup this cycle.")
+        if not API_DOWN_COMMANDS_RAN:
+            logger.warning("Storage data unavailable. Running stop command to prevent quota overrun.")
+            run_limit_command(COMMANDS_WHEN_LIMIT_HIT)
+            API_DOWN_COMMANDS_RAN = True
+            write_state({**read_state(), "api_down_commands_ran": True})
+            if RUNNING_ON_SERVER:
+                send_discord_message(
+                    title="Storage Commands Unavailable",
+                    description=(
+                        "The local storage commands (quota / app-traffic) failed to return data. "
+                        f"{_stop_description().capitalize()} as a precaution to prevent quota overrun. "
+                        "Will retry each cycle and run the recovery command automatically when the commands succeed again."
+                    ),
+                    color=Colors.RED
+                )
+            else:
+                send_discord_message(
+                    title="Ultra API Unreachable",
+                    description=(
+                        "The Ultra API (used to check storage and traffic usage) is not responding. "
+                        f"{_stop_description().capitalize()} as a precaution to prevent quota overrun. "
+                        "Will retry each cycle and run the recovery command automatically when the API comes back."
+                    ),
+                    color=Colors.RED
+                )
+
+    if qb_client:
+        cleanup_unregistered_torrents(qb_client)
+        for rule in _tracker_rules:
+            cleanup_inactive_tracker(qb_client, rule)
+        save_torrent_files(qb_client)
+    else:
+        logger.warning("qBittorrent unreachable. Skipping torrent cleanup this cycle.")
+
+    check_storage_mismatch()
+    manage_traffic_based_ssh_commands()
+
+
+def _hourly_job():
+    logger.info("Running hourly tasks...")
+    send_hourly_storage_update()
+    manage_traffic_based_ssh_commands(status_update=True)
+    qb_client = get_qbittorrent_client()
+    if qb_client:
+        send_next_torrents_to_delete_webhook(qb_client)
+
+
+# ----------------------------------
+# Main
 # ----------------------------------
 
 def main():
-    global BANDWIDTH_COMMANDS_RAN, STORAGE_COMMANDS_RAN, API_DOWN_COMMANDS_RAN
+    global BANDWIDTH_COMMANDS_RAN, STORAGE_COMMANDS_RAN, API_DOWN_COMMANDS_RAN, _tracker_rules
 
     validate_config()
     warn_optional_config()
-    tracker_rules = load_tracker_rules()
-    display_tracker_rules(tracker_rules)
+    _tracker_rules = load_tracker_rules()
+    display_tracker_rules(_tracker_rules)
 
     if RUNNING_ON_SERVER:
         validate_server_mode()
@@ -805,104 +910,15 @@ def main():
     send_hourly_storage_update()
     check_storage_mismatch()
 
-    last_update_time = time.time()
+    scheduler = BlockingScheduler(
+        executors={"default": ThreadPoolExecutor(1)},
+        job_defaults={"misfire_grace_time": 60},
+    )
+    scheduler.add_job(_five_minute_job, CronTrigger(minute="*/5"), id="five_minute", max_instances=1)
+    scheduler.add_job(_hourly_job, CronTrigger(minute="0"), id="hourly", max_instances=1)
 
-    while True:
-        logger.info("Running periodic checks...")
-
-        qb_client = get_qbittorrent_client()
-
-        # Storage-based cleanup
-        storage_data = get_storage_data()
-        if storage_data:
-            if API_DOWN_COMMANDS_RAN:
-                logger.info("Ultra API recovered. Running recovery command.")
-                run_limit_command(COMMANDS_WHEN_LIMIT_REFRESHED)
-                API_DOWN_COMMANDS_RAN = False
-                write_state({**read_state(), "api_down_commands_ran": False})
-                if RUNNING_ON_SERVER:
-                    send_discord_message(
-                        title="Storage Commands Recovered",
-                        description=f"Local storage commands are returning data again. {_start_description().capitalize()} and storage/traffic monitoring has resumed.",
-                        color=Colors.LIME
-                    )
-                else:
-                    send_discord_message(
-                        title="Ultra API Recovered",
-                        description=f"The Ultra API is back online. {_start_description().capitalize()} and storage/traffic monitoring has resumed.",
-                        color=Colors.LIME
-                    )
-
-            free_storage_gb = storage_data["service_stats_info"]["free_storage_gb"]
-
-            if free_storage_gb > MIN_FREE_GB and STORAGE_COMMANDS_RAN and not BANDWIDTH_COMMANDS_RAN:
-                logger.info("Storage recovered. Running recovery command.")
-                run_limit_command(COMMANDS_WHEN_LIMIT_REFRESHED)
-                STORAGE_COMMANDS_RAN = False
-                write_state({**read_state(), "storage_commands_ran": False})
-                send_discord_message(
-                    title="Storage Recovered",
-                    description=f"Free storage is back above {MIN_FREE_GB} GB. {_start_description().capitalize()}.",
-                    color=Colors.LIME
-                )
-
-            if qb_client:
-                cleanup_torrents(qb_client, free_storage_gb)
-            else:
-                send_discord_message(
-                    title="qBittorrent Unreachable",
-                    description="Could not connect to qBittorrent. Storage-based cleanup and torrent management will be skipped this cycle.",
-                    color=Colors.RED
-                )
-        else:
-            logger.warning("Storage data unavailable. Skipping storage-based cleanup this cycle.")
-            if not API_DOWN_COMMANDS_RAN:
-                logger.warning("Storage data unavailable. Running stop command to prevent quota overrun.")
-                run_limit_command(COMMANDS_WHEN_LIMIT_HIT)
-                API_DOWN_COMMANDS_RAN = True
-                write_state({**read_state(), "api_down_commands_ran": True})
-                if RUNNING_ON_SERVER:
-                    send_discord_message(
-                        title="Storage Commands Unavailable",
-                        description=(
-                            "The local storage commands (quota / app-traffic) failed to return data. "
-                            f"{_stop_description().capitalize()} as a precaution to prevent quota overrun. "
-                            "Will retry each cycle and run the recovery command automatically when the commands succeed again."
-                        ),
-                        color=Colors.RED
-                    )
-                else:
-                    send_discord_message(
-                        title="Ultra API Unreachable",
-                        description=(
-                            "The Ultra API (used to check storage and traffic usage) is not responding. "
-                            f"{_stop_description().capitalize()} as a precaution to prevent quota overrun. "
-                            "Will retry each cycle and run the recovery command automatically when the API comes back."
-                        ),
-                        color=Colors.RED
-                    )
-
-        if qb_client:
-            cleanup_unregistered_torrents(qb_client)
-
-            for rule in tracker_rules:
-                cleanup_inactive_tracker(qb_client, rule)
-
-            save_torrent_files(qb_client)
-        else:
-            logger.warning("qBittorrent unreachable. Skipping torrent cleanup this cycle.")
-
-        check_storage_mismatch()
-        manage_traffic_based_ssh_commands()
-
-        if time.time() - last_update_time >= 3600:
-            send_hourly_storage_update()
-            manage_traffic_based_ssh_commands(status_update=True)
-            if qb_client:
-                send_next_torrents_to_delete_webhook(qb_client)
-            last_update_time = time.time()
-
-        sleep(300)
+    logger.info("Scheduler started. Periodic checks run every 5 minutes; hourly tasks run on the hour.")
+    scheduler.start()
 
 
 if __name__ == "__main__":
