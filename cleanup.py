@@ -820,11 +820,18 @@ def main():
                 run_limit_command(COMMANDS_WHEN_LIMIT_REFRESHED)
                 API_DOWN_COMMANDS_RAN = False
                 write_state({**read_state(), "api_down_commands_ran": False})
-                send_discord_message(
-                    title="Ultra API Recovered",
-                    description=f"The Ultra API is back online. {_start_description().capitalize()} and storage/traffic monitoring has resumed.",
-                    color=Colors.LIME
-                )
+                if RUNNING_ON_SERVER:
+                    send_discord_message(
+                        title="Storage Commands Recovered",
+                        description=f"Local storage commands are returning data again. {_start_description().capitalize()} and storage/traffic monitoring has resumed.",
+                        color=Colors.LIME
+                    )
+                else:
+                    send_discord_message(
+                        title="Ultra API Recovered",
+                        description=f"The Ultra API is back online. {_start_description().capitalize()} and storage/traffic monitoring has resumed.",
+                        color=Colors.LIME
+                    )
 
             free_storage_gb = storage_data["service_stats_info"]["free_storage_gb"]
 
@@ -850,19 +857,30 @@ def main():
         else:
             logger.warning("Storage data unavailable. Skipping storage-based cleanup this cycle.")
             if not API_DOWN_COMMANDS_RAN:
-                logger.warning("Ultra API is down. Running stop command to prevent quota overrun.")
+                logger.warning("Storage data unavailable. Running stop command to prevent quota overrun.")
                 run_limit_command(COMMANDS_WHEN_LIMIT_HIT)
                 API_DOWN_COMMANDS_RAN = True
                 write_state({**read_state(), "api_down_commands_ran": True})
-                send_discord_message(
-                    title="Ultra API Unreachable",
-                    description=(
-                        "The Ultra API (used to check storage and traffic usage) is not responding. "
-                        f"{_stop_description().capitalize()} as a precaution to prevent quota overrun. "
-                        "Will retry each cycle and run the recovery command automatically when the API comes back."
-                    ),
-                    color=Colors.RED
-                )
+                if RUNNING_ON_SERVER:
+                    send_discord_message(
+                        title="Storage Commands Unavailable",
+                        description=(
+                            "The local storage commands (quota / app-traffic) failed to return data. "
+                            f"{_stop_description().capitalize()} as a precaution to prevent quota overrun. "
+                            "Will retry each cycle and run the recovery command automatically when the commands succeed again."
+                        ),
+                        color=Colors.RED
+                    )
+                else:
+                    send_discord_message(
+                        title="Ultra API Unreachable",
+                        description=(
+                            "The Ultra API (used to check storage and traffic usage) is not responding. "
+                            f"{_stop_description().capitalize()} as a precaution to prevent quota overrun. "
+                            "Will retry each cycle and run the recovery command automatically when the API comes back."
+                        ),
+                        color=Colors.RED
+                    )
 
         if qb_client:
             cleanup_unregistered_torrents(qb_client)
