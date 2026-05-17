@@ -138,6 +138,45 @@ def _still_stopped_description():
     return "the stop command has already run"
 
 
+def send_startup_state_message(state):
+    """Notify Discord of state.json values when the script starts."""
+    recovery_blocked = state["storage_commands_ran"] or state["bandwidth_commands_ran"]
+    if recovery_blocked:
+        color = Colors.FUCHSIA
+    elif state["api_down_commands_ran"]:
+        color = Colors.GREENYELLOW
+    else:
+        color = Colors.LIME
+
+    send_discord_message(
+        title="Script Started",
+        description="Loaded persisted state from state.json.",
+        color=color,
+        fields=[
+            {
+                "name": "storage_commands_ran",
+                "value": str(state["storage_commands_ran"]),
+                "inline": True,
+            },
+            {
+                "name": "bandwidth_commands_ran",
+                "value": str(state["bandwidth_commands_ran"]),
+                "inline": True,
+            },
+            {
+                "name": "api_down_commands_ran",
+                "value": str(state["api_down_commands_ran"]),
+                "inline": True,
+            },
+            {
+                "name": "Autobrr recovery on boot",
+                "value": "Blocked (storage or bandwidth limit active)" if recovery_blocked else "Allowed",
+                "inline": False,
+            },
+        ],
+    )
+
+
 # ----------------------------------
 # Startup validation
 # ----------------------------------
@@ -963,6 +1002,8 @@ def main():
     BANDWIDTH_COMMANDS_RAN = state["bandwidth_commands_ran"]
     STORAGE_COMMANDS_RAN = state["storage_commands_ran"]
     API_DOWN_COMMANDS_RAN = state["api_down_commands_ran"]
+
+    send_startup_state_message(state)
 
     send_hourly_storage_update()
     check_storage_mismatch()
