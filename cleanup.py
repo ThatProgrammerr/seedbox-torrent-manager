@@ -405,6 +405,28 @@ def run_limit_command(command):
             ssh_client.close()
 
 
+def autobrr_recovery_blocked():
+    """True when storage or bandwidth limits require autobrr to stay stopped."""
+    return STORAGE_COMMANDS_RAN or BANDWIDTH_COMMANDS_RAN
+
+
+def maybe_run_recovery_command():
+    """Run the recovery (start) command only if storage/bandwidth limits allow it."""
+    if autobrr_recovery_blocked():
+        reasons = []
+        if STORAGE_COMMANDS_RAN:
+            reasons.append("storage limit active")
+        if BANDWIDTH_COMMANDS_RAN:
+            reasons.append("bandwidth limit active")
+        logger.info(
+            "Skipping recovery command — autobrr stays stopped (%s).",
+            ", ".join(reasons),
+        )
+        return False
+    run_limit_command(COMMANDS_WHEN_LIMIT_REFRESHED)
+    return True
+
+
 # ----------------------------------
 # Traffic and storage checks
 # ----------------------------------
@@ -442,15 +464,24 @@ def manage_traffic_based_ssh_commands(status_update=False):
         )
 
     elif traffic_used_percentage < 10 and BANDWIDTH_COMMANDS_RAN:
-        logger.info("Traffic reset. Running recovery command.")
-        run_limit_command(COMMANDS_WHEN_LIMIT_REFRESHED)
+        logger.info("Traffic reset. Clearing bandwidth limit flag.")
         BANDWIDTH_COMMANDS_RAN = False
         write_state({**read_state(), "bandwidth_commands_ran": False})
-        send_discord_message(
-            title="Traffic Limit Refreshed",
-            description=f"Monthly traffic has reset. {_start_description().capitalize()}.",
-            color=Colors.GREEN
-        )
+        if maybe_run_recovery_command():
+            send_discord_message(
+                title="Traffic Limit Refreshed",
+                description=f"Monthly traffic has reset. {_start_description().capitalize()}.",
+                color=Colors.GREEN
+            )
+        else:
+            send_discord_message(
+                title="Traffic Limit Refreshed",
+                description=(
+                    "Monthly traffic has reset, but autobrr remains stopped because "
+                    "a storage or bandwidth limit is still active."
+                ),
+                color=Colors.GREENYELLOW
+            )
 
     elif traffic_used_percentage < TRAFFIC_LIMIT_THRESHOLD:
         logger.info(f"Traffic at {traffic_used_percentage}% — within limits.")
@@ -799,35 +830,61 @@ def _five_minute_job():
     storage_data = get_storage_data()
     if storage_data:
         if API_DOWN_COMMANDS_RAN:
-            logger.info("Storage data recovered. Running recovery command.")
-            run_limit_command(COMMANDS_WHEN_LIMIT_REFRESHED)
+            logger.info("Storage data recovered.")
             API_DOWN_COMMANDS_RAN = False
             write_state({**read_state(), "api_down_commands_ran": False})
-            if RUNNING_ON_SERVER:
-                send_discord_message(
-                    title="Storage Commands Recovered",
-                    description=f"Local storage commands are returning data again. {_start_description().capitalize()} and storage/traffic monitoring has resumed.",
-                    color=Colors.LIME
-                )
+            if maybe_run_recovery_command():
+                if RUNNING_ON_SERVER:
+                    send_discord_message(
+                        title="Storage Commands Recovered",
+                        description=(
+                            "Local storage commands are returning data again. "
+                            f"{_start_description().capitalize()} and storage/traffic monitoring has resumed."
+                        ),
+                        color=Colors.LIME
+                    )
+                else:
+                    send_discord_message(
+                        title="Ultra API Recovered",
+                        description=(
+                            f"The Ultra API is back online. {_start_description().capitalize()} "
+                            "and storage/traffic monitoring has resumed."
+                        ),
+                        color=Colors.LIME
+                    )
             else:
-                send_discord_message(
-                    title="Ultra API Recovered",
-                    description=f"The Ultra API is back online. {_start_description().capitalize()} and storage/traffic monitoring has resumed.",
-                    color=Colors.LIME
-                )
+                if RUNNING_ON_SERVER:
+                    send_discord_message(
+                        title="Storage Commands Recovered",
+                        description=(
+                            "Local storage commands are returning data again. "
+                            "Monitoring has resumed, but autobrr remains stopped because "
+                            "a storage or bandwidth limit is still active."
+                        ),
+                        color=Colors.LIME
+                    )
+                else:
+                    send_discord_message(
+                        title="Ultra API Recovered",
+                        description=(
+                            "The Ultra API is back online. Monitoring has resumed, but autobrr "
+                            "remains stopped because a storage or bandwidth limit is still active."
+                        ),
+                        color=Colors.LIME
+                    )
 
         free_storage_gb = storage_data["service_stats_info"]["free_storage_gb"]
 
         if free_storage_gb > MIN_FREE_GB and STORAGE_COMMANDS_RAN and not BANDWIDTH_COMMANDS_RAN:
-            logger.info("Storage recovered. Running recovery command.")
-            run_limit_command(COMMANDS_WHEN_LIMIT_REFRESHED)
+            logger.info("Storage recovered. Clearing storage limit flag.")
             STORAGE_COMMANDS_RAN = False
             write_state({**read_state(), "storage_commands_ran": False})
-            send_discord_message(
-                title="Storage Recovered",
-                description=f"Free storage is back above {MIN_FREE_GB} GB. {_start_description().capitalize()}.",
-                color=Colors.LIME
-            )
+            if maybe_run_recovery_command():
+                send_discord_message(
+                    title="Storage Recovered",
+                    description=f"Free storage is back above {MIN_FREE_GB} GB. {_start_description().capitalize()}.",
+                    color=Colors.LIME
+                )
 
         if qb_client:
             cleanup_torrents(qb_client, free_storage_gb)
@@ -839,9 +896,9 @@ def _five_minute_job():
             )
     else:
         logger.warning("Storage data unavailable. Skipping storage-based cleanup this cycle.")
+        logger.warning("Storage data unavailable. Running stop command to prevent quota overrun.")
+        run_limit_command(COMMANDS_WHEN_LIMIT_HIT)
         if not API_DOWN_COMMANDS_RAN:
-            logger.warning("Storage data unavailable. Running stop command to prevent quota overrun.")
-            run_limit_command(COMMANDS_WHEN_LIMIT_HIT)
             API_DOWN_COMMANDS_RAN = True
             write_state({**read_state(), "api_down_commands_ran": True})
             if RUNNING_ON_SERVER:
@@ -909,6 +966,10 @@ def main():
 
     send_hourly_storage_update()
     check_storage_mismatch()
+
+    logger.info("Running initial checks on startup...")
+    _five_minute_job()
+    _hourly_job()
 
     scheduler = BlockingScheduler(
         executors={"default": ThreadPoolExecutor(1)},
