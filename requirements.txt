@@ -5,3 +5,4 @@ python-dotenv
 pytz
 tabulate
 apscheduler
+pytest
