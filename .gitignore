@@ -1,7 +1,6 @@
 .env
 test_webhook.txt
 tests/
-standalone_tests/
 .pytest_cache/
 pytest.ini
 __pycache__/
