@@ -1,7 +1,7 @@
 [
   {
     "displayedName": "TorrentLeech",
-    "category": "tl",
+    "category": "torrentleech",
     "min_seed_time": 11,
     "min_seed_unit": "days"
   },
