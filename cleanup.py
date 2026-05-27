@@ -4,6 +4,7 @@ import time
 import logging
 import json
 import subprocess
+import shlex
 
 from pathlib import Path
 from dotenv import load_dotenv
@@ -11,6 +12,7 @@ from datetime import datetime, timezone
 from tabulate import tabulate
 from apscheduler.schedulers.blocking import BlockingScheduler
 from apscheduler.triggers.cron import CronTrigger
+from apscheduler.triggers.interval import IntervalTrigger
 from apscheduler.executors.pool import ThreadPoolExecutor
 
 from utilities import (
@@ -58,6 +60,20 @@ MIN_FREE_GB = int(os.getenv("MIN_FREE_GB", 300))
 MAX_DELETIONS_PER_RUN = int(os.getenv("MAX_DELETIONS_PER_RUN", 5))
 STORAGE_MISMATCH_THRESHOLD_GB = int(os.getenv("STORAGE_MISMATCH_THRESHOLD_GB", 200))
 TRAFFIC_LIMIT_THRESHOLD = int(os.getenv("TRAFFIC_LIMIT_THRESHOLD", 98))
+
+# ----------------------------------
+# Orphaned folder cleanup
+# ----------------------------------
+ORPHAN_CHECK_ENABLED = os.getenv("ORPHAN_CHECK_ENABLED", "false").lower() == "true"
+ORPHAN_REMOTE_PATH = os.getenv("ORPHAN_REMOTE_PATH", "").rstrip("/")
+ORPHAN_DELETE_PATH = os.getenv("ORPHAN_DELETE_PATH", "").rstrip("/")
+ORPHAN_CHECK_INTERVAL_HOURS = max(1, int(os.getenv("ORPHAN_CHECK_INTERVAL_HOURS", 6)))
+ORPHAN_MOVE_ENABLED = os.getenv("ORPHAN_MOVE_ENABLED", "false").lower() == "true"
+ORPHAN_IGNORE_FOLDERS = {
+    name.strip().lower()
+    for name in os.getenv("ORPHAN_IGNORE_FOLDERS", "").split(",")
+    if name.strip()
+}
 
 # ----------------------------------
 # Unregistered torrent cleanup
@@ -275,6 +291,24 @@ def warn_optional_config():
             "'unregistered' will not be automatically removed."
         )
 
+    # Orphan folder cleanup
+    if ORPHAN_CHECK_ENABLED:
+        if not ORPHAN_REMOTE_PATH:
+            logger.warning(
+                "ORPHAN_CHECK_ENABLED is true but ORPHAN_REMOTE_PATH is not set. "
+                "Orphan folder cleanup will be skipped."
+            )
+        elif not RUNNING_ON_SERVER and not SSH_CONFIGURED:
+            logger.warning(
+                "ORPHAN_CHECK_ENABLED is true but SSH is not configured in remote mode. "
+                "Orphan folder cleanup will be skipped."
+            )
+        elif not ORPHAN_MOVE_ENABLED:
+            logger.warning(
+                "ORPHAN_CHECK_ENABLED is true but ORPHAN_MOVE_ENABLED is false. "
+                "Orphan checks will run in dry-run mode (no folders moved)."
+            )
+
 
 def validate_server_mode():
     """
@@ -467,6 +501,183 @@ def maybe_run_recovery_command():
 
 
 # ----------------------------------
+# Orphaned folder checks
+# ----------------------------------
+def _orphan_delete_path():
+    if ORPHAN_DELETE_PATH:
+        return ORPHAN_DELETE_PATH.rstrip("/")
+    return f"{ORPHAN_REMOTE_PATH}/../delete".rstrip("/")
+
+
+def _extract_seed_folder_name(content_path):
+    path = (content_path or "").rstrip("/")
+    if not path:
+        return None
+    if ORPHAN_REMOTE_PATH and path.startswith(ORPHAN_REMOTE_PATH):
+        relative_path = path[len(ORPHAN_REMOTE_PATH):].lstrip("/")
+        if relative_path:
+            return relative_path.split("/")[0]
+    return os.path.basename(path)
+
+
+def _active_torrent_folders(qb_client):
+    folders = set()
+    for torrent in qb_client.torrents_info():
+        folder = _extract_seed_folder_name(getattr(torrent, "content_path", ""))
+        if folder:
+            folders.add(folder.lower())
+    return folders
+
+
+def _list_dirs_local(base_path):
+    try:
+        with os.scandir(base_path) as entries:
+            return {entry.name for entry in entries if entry.is_dir()}
+    except OSError as e:
+        logger.error(f"Failed to list local folders in {base_path!r}: {e}")
+        return set()
+
+
+def _list_dirs_remote(ssh_client, base_path):
+    quoted = shlex.quote(base_path)
+    command = f"find {quoted} -mindepth 1 -maxdepth 1 -type d -printf '%f\\n'"
+    output = run_ssh_command(ssh_client, command)
+    if output is None:
+        return set()
+    return {line.strip() for line in output.splitlines() if line.strip()}
+
+
+def _move_folder_local(source_dir, target_dir):
+    try:
+        os.makedirs(target_dir, exist_ok=True)
+        os.rename(source_dir, os.path.join(target_dir, os.path.basename(source_dir)))
+        return None
+    except OSError as e:
+        return str(e)
+
+
+def _move_folder_remote(ssh_client, source_dir, target_dir):
+    quoted_src = shlex.quote(source_dir)
+    quoted_dst = shlex.quote(target_dir)
+    command = f"(mkdir -p {quoted_dst} && mv {quoted_src} {quoted_dst}/ && echo __MOVE_OK__) || echo __MOVE_ERR__"
+    result = run_ssh_command(ssh_client, command)
+    if result and "__MOVE_OK__" in result:
+        return None
+    return (result or "Unknown SSH move failure").strip()
+
+
+def run_orphan_folder_cleanup(qb_client):
+    if not ORPHAN_CHECK_ENABLED:
+        return
+    if not ORPHAN_REMOTE_PATH:
+        logger.warning("Skipping orphan folder check: ORPHAN_REMOTE_PATH is not set.")
+        return
+    if qb_client is None:
+        logger.warning("Skipping orphan folder check: qBittorrent is unavailable.")
+        return
+    if not RUNNING_ON_SERVER and not SSH_CONFIGURED:
+        logger.warning("Skipping orphan folder check: SSH is not configured in remote mode.")
+        return
+
+    try:
+        active_folders = _active_torrent_folders(qb_client)
+    except Exception as e:
+        logger.error(f"Skipping orphan folder check: could not read active torrents: {e}")
+        return
+
+    if not active_folders:
+        logger.warning("Skipping orphan folder check: active torrent folder set is empty.")
+        send_discord_message(
+            title="Orphan Folder Check Skipped",
+            description="No active torrent folders were found in qBittorrent, so no move actions were taken.",
+            color=Colors.YELLOW,
+            url="orphan",
+        )
+        return
+
+    if RUNNING_ON_SERVER:
+        remote_folders = _list_dirs_local(ORPHAN_REMOTE_PATH)
+        ssh_client = None
+    else:
+        ssh_client = _get_ssh_client()
+        if ssh_client is None:
+            logger.warning("Skipping orphan folder check: SSH client unavailable.")
+            return
+        remote_folders = _list_dirs_remote(ssh_client, ORPHAN_REMOTE_PATH)
+
+    if not remote_folders:
+        logger.warning("Skipping orphan folder check: no folders were found in the seed directory.")
+        if ssh_client:
+            ssh_client.close()
+        return
+
+    remote_lookup = {folder.lower(): folder for folder in remote_folders}
+    orphan_keys = set(remote_lookup.keys()) - active_folders - ORPHAN_IGNORE_FOLDERS
+    orphans = sorted(remote_lookup[key] for key in orphan_keys)
+    delete_path = _orphan_delete_path()
+
+    if not orphans:
+        logger.info("Orphan folder check complete: no orphan folders found.")
+        if ssh_client:
+            ssh_client.close()
+        return
+
+    if not ORPHAN_MOVE_ENABLED:
+        logger.info(f"Orphan folder check dry-run found {len(orphans)} folder(s): {', '.join(orphans)}")
+        send_discord_message(
+            title="Orphan Folder Check (Dry Run)",
+            description=(
+                f"Found {len(orphans)} orphan folder(s) in `{ORPHAN_REMOTE_PATH}`, but no folders were moved "
+                "because ORPHAN_MOVE_ENABLED is false."
+            ),
+            color=Colors.YELLOW,
+            fields=[{"name": "Folders", "value": ", ".join(orphans[:20]), "inline": False}],
+            url="orphan",
+        )
+        if ssh_client:
+            ssh_client.close()
+        return
+
+    moved = []
+    errors = []
+    for folder in orphans:
+        src = f"{ORPHAN_REMOTE_PATH}/{folder}"
+        if RUNNING_ON_SERVER:
+            err = _move_folder_local(src, delete_path)
+        else:
+            err = _move_folder_remote(ssh_client, src, delete_path)
+        if err:
+            errors.append(f"{folder}: {err}")
+            logger.error(f"Failed moving orphan folder {folder!r}: {err}")
+        else:
+            moved.append(folder)
+            logger.info(f"Moved orphan folder {folder!r} to {delete_path!r}.")
+
+    if ssh_client:
+        ssh_client.close()
+
+    if moved:
+        send_discord_message(
+            title="Orphan Folders Moved",
+            description=(
+                f"Moved {len(moved)} orphan folder(s) from `{ORPHAN_REMOTE_PATH}` to `{delete_path}`. "
+                "Files were not deleted and can be restored from the delete directory if needed."
+            ),
+            color=Colors.TEAL,
+            fields=[{"name": "Moved", "value": ", ".join(moved[:20]), "inline": False}],
+            url="orphan",
+        )
+    if errors:
+        send_discord_message(
+            title="Orphan Folder Move Errors",
+            description=f"Failed to move {len(errors)} orphan folder(s).",
+            color=Colors.RED,
+            fields=[{"name": "Errors", "value": "\n".join(errors[:10]), "inline": False}],
+            url="orphan",
+        )
+
+
+# ----------------------------------
 # Traffic and storage checks
 # ----------------------------------
 
@@ -545,6 +756,10 @@ def manage_traffic_based_ssh_commands(status_update=False):
 
 
 def check_storage_mismatch():
+    if ORPHAN_CHECK_ENABLED:
+        logger.info("Storage mismatch alert skipped because orphan folder checks are enabled.")
+        return
+
     storage_data = get_storage_data()
     if not storage_data:
         return
@@ -982,6 +1197,13 @@ def _hourly_job():
         send_next_torrents_to_delete_webhook(qb_client)
 
 
+def _orphan_job():
+    logger.info("Running orphan folder check job...")
+    qb_client = get_qbittorrent_client()
+    if qb_client:
+        run_orphan_folder_cleanup(qb_client)
+
+
 # ----------------------------------
 # Main
 # ----------------------------------
@@ -1006,6 +1228,7 @@ def main():
     send_startup_state_message(state)
 
     send_hourly_storage_update()
+    _orphan_job()
     check_storage_mismatch()
 
     logger.info("Running initial checks on startup...")
@@ -1018,8 +1241,18 @@ def main():
     )
     scheduler.add_job(_five_minute_job, CronTrigger(minute="*/5"), id="five_minute", max_instances=1)
     scheduler.add_job(_hourly_job, CronTrigger(minute="0"), id="hourly", max_instances=1)
+    if ORPHAN_CHECK_ENABLED:
+        scheduler.add_job(
+            _orphan_job,
+            IntervalTrigger(hours=ORPHAN_CHECK_INTERVAL_HOURS),
+            id="orphan_check",
+            max_instances=1,
+        )
 
-    logger.info("Scheduler started. Periodic checks run every 5 minutes; hourly tasks run on the hour.")
+    logger.info(
+        "Scheduler started. Periodic checks run every 5 minutes; hourly tasks run on the hour; "
+        f"orphan checks run every {ORPHAN_CHECK_INTERVAL_HOURS} hour(s) when enabled."
+    )
     scheduler.start()
 
 

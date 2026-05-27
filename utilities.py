@@ -13,6 +13,7 @@ load_dotenv(dotenv_path=Path(__file__).parent / ".env")
 
 DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL")
 INACTIVE_DISCORD_URL = os.getenv("INACTIVE_DISCORD_URL")
+ORPHAN_DISCORD_URL = os.getenv("ORPHAN_DISCORD_URL")
 TIMEZONE = os.getenv("TIMEZONE", "UTC")
 SSH_STRICT_HOST_KEYS = os.getenv("SSH_STRICT_HOST_KEYS", "false").lower() == "true"
 
@@ -210,6 +211,11 @@ def send_discord_message(
         webhook_url = INACTIVE_DISCORD_URL
         if not webhook_url:
             logger.debug("INACTIVE_DISCORD_URL not set, skipping notification.")
+            return
+    elif url == "orphan":
+        webhook_url = ORPHAN_DISCORD_URL or DISCORD_WEBHOOK_URL
+        if not webhook_url:
+            logger.debug("ORPHAN_DISCORD_URL and DISCORD_WEBHOOK_URL not set, skipping notification.")
             return
     else:
         logger.warning(f"Unknown Discord URL key: {url}")

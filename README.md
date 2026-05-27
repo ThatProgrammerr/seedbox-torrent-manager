@@ -17,6 +17,7 @@ Integrates with Discord for notifications and supports two deployment modes for 
 - **Traffic limit handling** — monitors your monthly traffic usage and runs a configurable command when you approach the limit (e.g. stopping AutoBRR).
 - **API outage protection** — if the Ultra API becomes unreachable, the stop command is run automatically to prevent quota overrun. AutoBRR is restarted once the API recovers.
 - **Storage mismatch alerts** — warns when your reported storage and qBittorrent's total diverge significantly (a sign of orphaned files).
+- **Orphaned folder cleanup** — on a configurable schedule, compares qBittorrent content folders to the seed directory and moves orphaned folders into a safe delete directory (restorable before manual emptying).
 - **Hourly Discord summary** — posts free storage, traffic status, and a table of the next torrents in line for deletion.
 - **Torrent file backup** — exports `.torrent` files from qBittorrent into a local backup folder. Handles a corrupted index gracefully by renaming it to `.corrupted` and starting fresh.
 
@@ -94,6 +95,7 @@ All configuration is via `.env`. See `.env.example` for the full list with descr
 | `BEARER_TOKEN` | No | Bearer token for the storage API. Not needed if `RUNNING_ON_SERVER=true`. |
 | `DISCORD_WEBHOOK_URL` | No | Discord webhook for general notifications. |
 | `INACTIVE_DISCORD_URL` | No | Discord webhook specifically for tracker-inactive deletions. |
+| `ORPHAN_DISCORD_URL` | No | Optional dedicated Discord webhook for orphan-folder check notifications. Falls back to `DISCORD_WEBHOOK_URL` when unset. |
 | `SSH_SERVER` | No* | SSH hostname. Not needed if `RUNNING_ON_SERVER=true`. If omitted in remote mode, all SSH-based automation is disabled (see below). |
 | `SSH_PORT` | No | SSH port (default: `22`) |
 | `SSH_USERNAME` | No* | SSH username (required if `SSH_SERVER` is set) |
@@ -105,6 +107,12 @@ All configuration is via `.env`. See `.env.example` for the full list with descr
 | `MAX_DELETIONS_PER_RUN` | No | Max torrents deleted per cleanup pass (default: `5`) |
 | `STORAGE_MISMATCH_THRESHOLD_GB` | No | Gap in GB before a mismatch alert fires (default: `200`) |
 | `TRAFFIC_LIMIT_THRESHOLD` | No | Traffic usage % before limit command runs (default: `98`) |
+| `ORPHAN_CHECK_ENABLED` | No | Enable scheduled orphan-folder checks (default: `false`) |
+| `ORPHAN_REMOTE_PATH` | No | Seed root path used to detect orphaned folders (required if orphan checks enabled) |
+| `ORPHAN_DELETE_PATH` | No | Destination path where orphaned folders are moved. Default: `ORPHAN_REMOTE_PATH/../delete` |
+| `ORPHAN_MOVE_ENABLED` | No | If `false`, orphan checks run in dry-run mode and only report findings (default: `false`) |
+| `ORPHAN_CHECK_INTERVAL_HOURS` | No | Hours between orphan-folder checks (default: `6`) |
+| `ORPHAN_IGNORE_FOLDERS` | No | Comma-separated folder names to exclude from orphan moves |
 | `UNREGISTERED_CHECK_ENABLED` | No | Enable unregistered torrent cleanup (default: `true`) |
 | `UNREGISTERED_INACTIVE_HOURS` | No | Hours inactive before an unregistered torrent is deleted (default: `6`) |
 | `TIMEZONE` | No | IANA timezone for activity timestamps (default: `UTC`) |
@@ -121,6 +129,20 @@ The script will log a warning at startup for each disabled feature, so you know 
 | `DISCORD_WEBHOOK_URL` | No Discord notifications for deletions, storage alerts, errors, or hourly summaries. Everything still appears in the log. |
 | `INACTIVE_DISCORD_URL` | No Discord notifications specifically for tracker-inactive deletions. |
 | `UNREGISTERED_CHECK_ENABLED=false` | Torrents marked as unregistered by their tracker are left alone. |
+| `ORPHAN_CHECK_ENABLED=true` without `ORPHAN_REMOTE_PATH` | Orphan-folder checks are skipped because no seed path is configured. |
+
+### Orphaned folder cleanup
+
+When enabled, the script periodically:
+
+1. Reads active torrent content folders from qBittorrent.
+2. Lists folders in `ORPHAN_REMOTE_PATH`.
+3. Finds folders present on disk but no longer linked to any active torrent.
+4. Moves those folders into `ORPHAN_DELETE_PATH` (or `ORPHAN_REMOTE_PATH/../delete` by default).
+
+This intentionally does **not** permanently delete files. Users can review and restore from the delete folder before manually emptying it.
+
+In `RUNNING_ON_SERVER=true` mode this operation runs locally. In remote mode it runs over SSH.
 
 ### Tracker cleanup rules (`tracker_rules.json`)
 
