@@ -756,10 +756,6 @@ def manage_traffic_based_ssh_commands(status_update=False):
 
 
 def check_storage_mismatch():
-    if ORPHAN_CHECK_ENABLED:
-        logger.info("Storage mismatch alert skipped because orphan folder checks are enabled.")
-        return
-
     storage_data = get_storage_data()
     if not storage_data:
         return

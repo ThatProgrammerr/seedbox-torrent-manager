@@ -144,6 +144,8 @@ This intentionally does **not** permanently delete files. Users can review and r
 
 In `RUNNING_ON_SERVER=true` mode this operation runs locally. In remote mode it runs over SSH.
 
+Storage mismatch alerts continue to run independently. If both a mismatch alert and an orphan-folder finding appear, that warrants investigation — the gap may be orphaned seed folders, or something else entirely (logs, files outside the seed path, etc.).
+
 ### Tracker cleanup rules (`tracker_rules.json`)
 
 Tracker-specific seeding rules are configured in `tracker_rules.json`, not in `.env`. This lets you define as many trackers as you need, each with their own minimum seeding time.
