@@ -24,6 +24,48 @@ QB_PASSWORD = os.getenv("QB_PASSWORD", "adminadmin")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
 
+_STORAGE_FETCH_ERROR = None
+_COMMAND_TIMEOUT_SECONDS = 10
+
+
+def get_storage_fetch_error():
+    """Returns diagnostic detail from the most recent failed storage data fetch."""
+    return _STORAGE_FETCH_ERROR or "Unknown error — no diagnostic information available."
+
+
+def _set_storage_fetch_error(error):
+    global _STORAGE_FETCH_ERROR
+    _STORAGE_FETCH_ERROR = error
+
+
+def _clear_storage_fetch_error():
+    global _STORAGE_FETCH_ERROR
+    _STORAGE_FETCH_ERROR = None
+
+
+def _format_subprocess_output(result):
+    parts = []
+    if result.returncode != 0:
+        parts.append(f"exit code: {result.returncode}")
+    stdout = (result.stdout or "").strip()
+    stderr = (result.stderr or "").strip()
+    if stdout:
+        parts.append(f"stdout:\n{stdout}")
+    if stderr:
+        parts.append(f"stderr:\n{stderr}")
+    if not parts:
+        parts.append("(no output)")
+    return "\n".join(parts)
+
+
+def _format_command_error(command, result):
+    return f"$ {' '.join(command)}\n{_format_subprocess_output(result)}"
+
+
+def _format_timeout_error(command, timeout_seconds):
+    timeout_ms = int(timeout_seconds * 1000)
+    return f"$ {' '.join(command)}\nExperienced a timeout of {timeout_ms}ms"
+
 
 def _parse_quota_size(value_str):
     """Convert a quota -s size string (e.g. '512G', '1024M*') to bytes."""
@@ -40,10 +82,26 @@ def get_storage_data_local():
     Fetches storage and traffic statistics using local system commands.
     Used when RUNNING_ON_SERVER=true. Returns the same structure as get_storage_data().
     """
+    quota_command = ["quota", "-s"]
+    traffic_command = ["app-traffic", "info"]
+
     try:
-        quota_result = subprocess.run(
-            ["quota", "-s"], capture_output=True, text=True, timeout=10
-        )
+        try:
+            quota_result = subprocess.run(
+                quota_command, capture_output=True, text=True, timeout=_COMMAND_TIMEOUT_SECONDS
+            )
+        except subprocess.TimeoutExpired:
+            error = _format_timeout_error(quota_command, _COMMAND_TIMEOUT_SECONDS)
+            logger.error(f"Timed out running 'quota -s': {error}")
+            _set_storage_fetch_error(error)
+            return None
+
+        if quota_result.returncode != 0:
+            error = _format_command_error(quota_command, quota_result)
+            logger.error(f"'quota -s' failed: {error}")
+            _set_storage_fetch_error(error)
+            return None
+
         used_bytes = None
         total_bytes = None
         for line in quota_result.stdout.splitlines():
@@ -54,16 +112,35 @@ def get_storage_data_local():
                 break
 
         if used_bytes is None or total_bytes is None:
+            error = (
+                f"$ {' '.join(quota_command)}\n"
+                "Could not parse output.\n"
+                f"{_format_subprocess_output(quota_result)}"
+            )
             logger.error("Could not parse 'quota -s' output.")
+            _set_storage_fetch_error(error)
             return None
 
         free_bytes = max(0.0, total_bytes - used_bytes)
         free_gb = free_bytes / (1024 ** 3)
         used_mb = used_bytes / (1024 ** 2)
 
-        traffic_result = subprocess.run(
-            ["app-traffic", "info"], capture_output=True, text=True, timeout=10
-        )
+        try:
+            traffic_result = subprocess.run(
+                traffic_command, capture_output=True, text=True, timeout=_COMMAND_TIMEOUT_SECONDS
+            )
+        except subprocess.TimeoutExpired:
+            error = _format_timeout_error(traffic_command, _COMMAND_TIMEOUT_SECONDS)
+            logger.error(f"Timed out running 'app-traffic info': {error}")
+            _set_storage_fetch_error(error)
+            return None
+
+        if traffic_result.returncode != 0:
+            error = _format_command_error(traffic_command, traffic_result)
+            logger.error(f"'app-traffic info' failed: {error}")
+            _set_storage_fetch_error(error)
+            return None
+
         traffic_available_pct = None
         for line in traffic_result.stdout.splitlines():
             if "traffic available:" in line.lower():
@@ -73,11 +150,18 @@ def get_storage_data_local():
                     break
 
         if traffic_available_pct is None:
+            error = (
+                f"$ {' '.join(traffic_command)}\n"
+                "Could not parse output.\n"
+                f"{_format_subprocess_output(traffic_result)}"
+            )
             logger.error("Could not parse 'app-traffic info' output.")
+            _set_storage_fetch_error(error)
             return None
 
         traffic_used_pct = round(100 - traffic_available_pct, 2)
 
+        _clear_storage_fetch_error()
         return {
             "service_stats_info": {
                 "free_storage_gb": free_gb,
@@ -87,7 +171,9 @@ def get_storage_data_local():
             }
         }
     except Exception as e:
-        logger.exception(f"Error fetching local storage data: {e}")
+        error = f"Unexpected error fetching local storage data: {e}"
+        logger.exception(error)
+        _set_storage_fetch_error(error)
         return None
 
 

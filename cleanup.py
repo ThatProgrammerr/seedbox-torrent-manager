@@ -29,6 +29,7 @@ from utilities import (
 
 from helpers import (
     get_storage_data,
+    get_storage_fetch_error,
     get_qbittorrent_client,
     get_total_torrent_size,
 )
@@ -1152,6 +1153,9 @@ def _five_minute_job():
             API_DOWN_COMMANDS_RAN = True
             write_state({**read_state(), "api_down_commands_ran": True})
             if RUNNING_ON_SERVER:
+                error_detail = get_storage_fetch_error()
+                if len(error_detail) > 990:
+                    error_detail = error_detail[:987] + "..."
                 send_discord_message(
                     title="Storage Commands Unavailable",
                     description=(
@@ -1159,7 +1163,12 @@ def _five_minute_job():
                         f"{_stop_description().capitalize()} as a precaution to prevent quota overrun. "
                         "Will retry each cycle and run the recovery command automatically when the commands succeed again."
                     ),
-                    color=Colors.RED
+                    color=Colors.RED,
+                    fields=[{
+                        "name": "Error details",
+                        "value": f"```\n{error_detail}\n```",
+                        "inline": False,
+                    }],
                 )
             else:
                 send_discord_message(
