@@ -11,6 +11,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Configurable live status check (`COMMAND_LIMIT_STATUS`, optional `COMMAND_LIMIT_STATUS_RUNNING_PATTERN`) so that while a traffic/storage/API limit is active, the stop command is re-run if the managed app (e.g. AutoBRR) comes back up after a node reboot.
 - Ultra.cc-compatible user systemd unit at `deploy/seedbox-torrent-manager.service`, with install/enable instructions in the README (no `screen` / `sudo` required).
 - Project changelog (`CHANGELOG.md`).
+- Incomplete-download reservation check: AutoBRR stop/recover and storage cleanup use **effective free** space (`quota free − Σ amount_left`), so unfinished torrents cannot overfill the quota while still downloading. Hourly Discord storage updates include reserved and effective free figures.
 
 ### Changed
 

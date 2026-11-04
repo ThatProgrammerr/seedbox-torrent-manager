@@ -13,7 +13,7 @@ Integrates with Discord for notifications and supports two deployment modes for 
 
 ## What it does
 
-- **Storage-based cleanup** — when free space drops below a threshold, deletes the oldest/least popular seeded torrents (ratio ≥ 1.0, inactive for 2+ hours) until space is recovered.
+- **Storage-based cleanup** — when effective free space drops below a threshold, deletes the oldest/least popular seeded torrents (ratio ≥ 1.0, inactive for 2+ hours) until space is recovered. Incomplete downloads count as reserved space (`effective_free = quota_free − Σ amount_left`), so AutoBRR is stopped before unfinished torrents can overfill the quota.
 - **Unregistered torrent cleanup** — detects torrents the tracker has marked as "unregistered" and removes them after a configurable inactivity period.
 - **Tracker-specific rules** — deletes torrents from specific trackers after their minimum seeding period has passed and they've been inactive for 24+ hours. Ships with rules for TorrentLeech and IPTorrents; fully configurable.
 - **Traffic limit handling** — monitors your monthly traffic usage and runs a configurable command when you approach the limit (e.g. stopping AutoBRR).
@@ -109,7 +109,7 @@ All configuration is via `.env`. See `.env.example` for the full list with descr
 | `COMMAND_LIMIT_REFRESHED` | No | Command to run when traffic/storage recovers. Executed over SSH in remote mode, locally in server mode. If unset, no command runs. |
 | `COMMAND_LIMIT_STATUS` | No | Command that reports whether the managed app (e.g. AutoBRR) is running. While a limit is active, this is checked each cycle and `COMMAND_LIMIT_HIT` is re-run if the app is up again (e.g. after a node reboot). Exit code `0` means running unless a pattern is set. |
 | `COMMAND_LIMIT_STATUS_RUNNING_PATTERN` | No | Optional case-insensitive regex matched against status command output. When set, the app is considered running only if the pattern matches. |
-| `MIN_FREE_GB` | No | Minimum free GB before cleanup triggers (default: `300`) |
+| `MIN_FREE_GB` | No | Minimum **effective** free GB before cleanup / AutoBRR stop triggers (default: `300`). Effective free subtracts bytes still left to download on incomplete torrents. |
 | `MAX_DELETIONS_PER_RUN` | No | Max torrents deleted per cleanup pass (default: `5`) |
 | `STORAGE_MISMATCH_THRESHOLD_GB` | No | Gap in GB before a mismatch alert fires (default: `200`) |
 | `TRAFFIC_LIMIT_THRESHOLD` | No | Traffic usage % before limit command runs (default: `98`) |

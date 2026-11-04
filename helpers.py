@@ -246,3 +246,51 @@ def get_total_torrent_size(qb_client):
             color=Colors.RED
         )
         return None
+
+
+def get_incomplete_download_reservation_gb(qb_client):
+    """
+    Space still committed to unfinished downloads, in GB.
+
+    Quota/free disk only reflects bytes written so far. Incomplete torrents still
+    need their remaining payload (`amount_left`), so that remainder is treated as
+    reserved — it will be used as downloads finish.
+    """
+    try:
+        torrents = qb_client.torrents_info()
+        reserved_bytes = 0
+        incomplete_count = 0
+        for torrent in torrents:
+            amount_left = getattr(torrent, "amount_left", None)
+            if amount_left is None:
+                # Fall back if the client omits amount_left.
+                size = getattr(torrent, "size", 0) or 0
+                completed = getattr(torrent, "completed", None)
+                if completed is None:
+                    progress = getattr(torrent, "progress", 1) or 0
+                    completed = size * progress
+                amount_left = max(0, size - completed)
+            amount_left = max(0, amount_left or 0)
+            if amount_left > 0:
+                reserved_bytes += amount_left
+                incomplete_count += 1
+        reserved_gb = reserved_bytes / (1024 ** 3)
+        logger.info(
+            "Incomplete download reservation: %.2f GB across %s torrent(s).",
+            reserved_gb,
+            incomplete_count,
+        )
+        return reserved_gb
+    except Exception as e:
+        logger.exception(f"Error retrieving incomplete download reservation: {e}")
+        send_discord_message(
+            title="qBittorrent Error",
+            description="Failed to retrieve incomplete download reservation size.",
+            color=Colors.RED,
+        )
+        return None
+
+
+def effective_free_storage_gb(free_storage_gb, reserved_download_gb):
+    """Free quota remaining after accounting for unfinished download payload."""
+    return free_storage_gb - reserved_download_gb

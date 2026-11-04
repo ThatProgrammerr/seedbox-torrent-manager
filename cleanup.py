@@ -34,6 +34,8 @@ from helpers import (
     get_storage_fetch_error,
     get_qbittorrent_client,
     get_total_torrent_size,
+    get_incomplete_download_reservation_gb,
+    effective_free_storage_gb,
 )
 
 load_dotenv(dotenv_path=Path(__file__).parent / ".env")
@@ -1078,13 +1080,49 @@ def check_storage_mismatch():
 
 def send_hourly_storage_update():
     storage_data = get_storage_data()
-    if storage_data:
-        free_gb = storage_data["service_stats_info"]["free_storage_gb"]
-        send_discord_message(
-            title="Hourly Storage Update",
-            description=f"Free storage: {free_gb:.2f} GB (minimum threshold: {MIN_FREE_GB} GB)",
-            color=Colors.LIME
-        )
+    if not storage_data:
+        return
+
+    free_gb = storage_data["service_stats_info"]["free_storage_gb"]
+    fields = [
+        {"name": "Free (quota)", "value": f"{free_gb:.2f} GB", "inline": True},
+        {"name": "Minimum", "value": f"{MIN_FREE_GB} GB", "inline": True},
+    ]
+    description = f"Free storage: {free_gb:.2f} GB (minimum threshold: {MIN_FREE_GB} GB)"
+    color = Colors.LIME
+
+    qb_client = get_qbittorrent_client()
+    if qb_client:
+        reserved_gb = get_incomplete_download_reservation_gb(qb_client)
+        if reserved_gb is not None:
+            effective_gb = effective_free_storage_gb(free_gb, reserved_gb)
+            fields.extend([
+                {
+                    "name": "Reserved (downloading)",
+                    "value": f"{reserved_gb:.2f} GB",
+                    "inline": True,
+                },
+                {
+                    "name": "Effective free",
+                    "value": f"{effective_gb:.2f} GB",
+                    "inline": True,
+                },
+            ])
+            description = (
+                f"Quota free: {free_gb:.2f} GB. "
+                f"Reserved by incomplete downloads: {reserved_gb:.2f} GB. "
+                f"Effective free: {effective_gb:.2f} GB "
+                f"(minimum threshold: {MIN_FREE_GB} GB)."
+            )
+            if effective_gb < MIN_FREE_GB:
+                color = Colors.FUCHSIA
+
+    send_discord_message(
+        title="Hourly Storage Update",
+        description=description,
+        color=color,
+        fields=fields,
+    )
 
 
 # ----------------------------------
@@ -1102,15 +1140,38 @@ def delete_torrent(qb_client, torrent, real_delete=False):
 def cleanup_torrents(qb_client, free_storage_gb):
     global STORAGE_COMMANDS_RAN, BANDWIDTH_COMMANDS_RAN
 
-    logger.info(f"Running storage-based cleanup. Free: {free_storage_gb:.2f} GB, minimum: {MIN_FREE_GB} GB.")
+    reserved_gb = get_incomplete_download_reservation_gb(qb_client)
+    if reserved_gb is None:
+        reserved_gb = 0.0
+        logger.warning(
+            "Could not read incomplete download reservation; treating reserved space as 0 GB this cycle."
+        )
 
-    if free_storage_gb < MIN_FREE_GB and not STORAGE_COMMANDS_RAN and not BANDWIDTH_COMMANDS_RAN:
-        logger.error("Storage below threshold. Running stop command.")
+    effective_free_gb = effective_free_storage_gb(free_storage_gb, reserved_gb)
+    logger.info(
+        "Running storage-based cleanup. Free: %.2f GB, reserved by downloads: %.2f GB, "
+        "effective free: %.2f GB, minimum: %s GB.",
+        free_storage_gb,
+        reserved_gb,
+        effective_free_gb,
+        MIN_FREE_GB,
+    )
+
+    if effective_free_gb < MIN_FREE_GB and not STORAGE_COMMANDS_RAN and not BANDWIDTH_COMMANDS_RAN:
+        logger.error(
+            "Effective free storage below threshold (quota free %.2f GB minus %.2f GB still downloading). "
+            "Running stop command.",
+            free_storage_gb,
+            reserved_gb,
+        )
         send_discord_message(
             title="Critical Storage Alert",
             description=(
-                f"Free storage has dropped below the {MIN_FREE_GB} GB minimum threshold. "
-                f"{_stop_description().capitalize()} while cleanup runs."
+                f"Effective free storage has dropped below the {MIN_FREE_GB} GB minimum threshold "
+                f"(quota free: {free_storage_gb:.2f} GB, reserved by incomplete downloads: "
+                f"{reserved_gb:.2f} GB, effective: {effective_free_gb:.2f} GB). "
+                f"{_stop_description().capitalize()} while cleanup runs. "
+                "Incomplete downloads count as reserved space — that payload will still be used."
             ),
             color=Colors.RED
         )
@@ -1132,12 +1193,11 @@ def cleanup_torrents(qb_client, free_storage_gb):
         reverse=True,
     )
 
-    freed_space = 0
     deletions = 0
 
     for torrent in candidates:
-        if free_storage_gb - freed_space >= MIN_FREE_GB:
-            logger.info("Minimum free space achieved. Stopping cleanup.")
+        if effective_free_gb >= MIN_FREE_GB:
+            logger.info("Minimum effective free space achieved. Stopping cleanup.")
             return
 
         if deletions >= MAX_DELETIONS_PER_RUN:
@@ -1146,8 +1206,8 @@ def cleanup_torrents(qb_client, free_storage_gb):
                 title="Cleanup Limit Reached",
                 description=(
                     f"Reached the {MAX_DELETIONS_PER_RUN} deletion limit for this cycle — this is a safety cap to avoid "
-                    "removing too many torrents at once. Storage is still below the minimum, but cleanup will "
-                    "re-evaluate and continue on the next cycle (every 5 minutes)."
+                    "removing too many torrents at once. Effective free storage is still below the minimum, but cleanup "
+                    "will re-evaluate and continue on the next cycle (every 5 minutes)."
                 ),
                 color=Colors.YELLOW
             )
@@ -1155,11 +1215,19 @@ def cleanup_torrents(qb_client, free_storage_gb):
 
         delete_torrent(qb_client, torrent, real_delete=True)
         space_gb = torrent.size / (1024 ** 3)
-        freed_space += space_gb
-        free_storage_gb += space_gb
+        amount_left = getattr(torrent, "amount_left", 0) or 0
+        reserved_released_gb = amount_left / (1024 ** 3)
+        # Completed bytes were already on disk; deleting frees them into quota.
+        # Any remaining amount_left is no longer reserved.
+        free_storage_gb += max(0.0, space_gb - reserved_released_gb)
+        reserved_gb = max(0.0, reserved_gb - reserved_released_gb)
+        effective_free_gb = effective_free_storage_gb(free_storage_gb, reserved_gb)
         deletions += 1
 
-        logger.info(f"Deleted: {torrent.name} | Freed: {space_gb:.2f} GB")
+        logger.info(
+            f"Deleted: {torrent.name} | Size: {space_gb:.2f} GB | "
+            f"Effective free now: {effective_free_gb:.2f} GB"
+        )
         send_discord_message(
             title="Deleted Torrent (Storage Cleanup)",
             description=f"Torrent: {torrent.name}",
@@ -1377,16 +1445,32 @@ def _five_minute_job():
 
         free_storage_gb = storage_data["service_stats_info"]["free_storage_gb"]
 
-        if free_storage_gb > MIN_FREE_GB and STORAGE_COMMANDS_RAN and not BANDWIDTH_COMMANDS_RAN:
-            logger.info("Storage recovered. Clearing storage limit flag.")
-            STORAGE_COMMANDS_RAN = False
-            write_state({**read_state(), "storage_commands_ran": False})
-            if maybe_run_recovery_command():
-                send_discord_message(
-                    title="Storage Recovered",
-                    description=f"Free storage is back above {MIN_FREE_GB} GB. {_start_description().capitalize()}.",
-                    color=Colors.LIME
+        if qb_client and STORAGE_COMMANDS_RAN and not BANDWIDTH_COMMANDS_RAN:
+            reserved_gb = get_incomplete_download_reservation_gb(qb_client)
+            if reserved_gb is None:
+                reserved_gb = 0.0
+            effective_free_gb = effective_free_storage_gb(free_storage_gb, reserved_gb)
+            if effective_free_gb > MIN_FREE_GB:
+                logger.info(
+                    "Storage recovered (effective free %.2f GB = quota free %.2f GB minus "
+                    "%.2f GB reserved by downloads). Clearing storage limit flag.",
+                    effective_free_gb,
+                    free_storage_gb,
+                    reserved_gb,
                 )
+                STORAGE_COMMANDS_RAN = False
+                write_state({**read_state(), "storage_commands_ran": False})
+                if maybe_run_recovery_command():
+                    send_discord_message(
+                        title="Storage Recovered",
+                        description=(
+                            f"Effective free storage is back above {MIN_FREE_GB} GB "
+                            f"(quota free: {free_storage_gb:.2f} GB, reserved by incomplete "
+                            f"downloads: {reserved_gb:.2f} GB, effective: {effective_free_gb:.2f} GB). "
+                            f"{_start_description().capitalize()}."
+                        ),
+                        color=Colors.LIME
+                    )
 
         if qb_client:
             cleanup_torrents(qb_client, free_storage_gb)
