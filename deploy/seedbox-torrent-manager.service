@@ -1,0 +1,26 @@
+# Ultra.cc / UltraSeedbox compatible user systemd unit.
+# Install under: ~/.config/systemd/user/seedbox-torrent-manager.service
+#
+# Adjust WorkingDirectory and ExecStart if you cloned the repo somewhere else
+# or use a different Python interpreter / virtualenv.
+#
+# %h expands to your home directory (e.g. /home/USERNAME).
+
+[Unit]
+Description=Seedbox Torrent Manager
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/seedbox-torrent-manager
+Environment=PYTHONUNBUFFERED=1
+# Prefer a project virtualenv when present; otherwise use system python3:
+ExecStart=%h/seedbox-torrent-manager/.venv/bin/python %h/seedbox-torrent-manager/cleanup.py
+# ExecStart=%h/seedbox-torrent-manager/venv/bin/python %h/seedbox-torrent-manager/cleanup.py
+# ExecStart=/usr/bin/python3 %h/seedbox-torrent-manager/cleanup.py
+Restart=always
+RestartSec=30
+
+[Install]
+WantedBy=default.target

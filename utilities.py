@@ -180,15 +180,33 @@ def run_ssh_command(ssh_client, command):
     if ssh_client is None:
         return "SSH client is not connected."
     try:
-        stdin, stdout, stderr = ssh_client.exec_command(command)
-        output = stdout.read().decode()
-        error = stderr.read().decode()
+        exit_code, output, error = run_ssh_command_result(ssh_client, command)
         if error:
             logger.warning(f"SSH command error output: {error}")
+        if exit_code is None:
+            return output or error or "Error executing command"
         return output or error
     except Exception as e:
         logger.error(f"Failed to execute SSH command: {e}")
         return f"Error executing command: {e}"
+
+
+def run_ssh_command_result(ssh_client, command):
+    """
+    Run an SSH command and return (exit_code, stdout, stderr).
+    exit_code is None when the command could not be executed.
+    """
+    if ssh_client is None:
+        return None, "", "SSH client is not connected."
+    try:
+        _stdin, stdout, stderr = ssh_client.exec_command(command)
+        output = stdout.read().decode()
+        error = stderr.read().decode()
+        exit_code = stdout.channel.recv_exit_status()
+        return exit_code, output, error
+    except Exception as e:
+        logger.error(f"Failed to execute SSH command: {e}")
+        return None, "", str(e)
 
 
 def send_discord_message(

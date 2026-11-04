@@ -1,4 +1,5 @@
 import os
+import re
 import sys
 import time
 import logging
@@ -25,6 +26,7 @@ from utilities import (
     timestamp_seconds,
     create_ssh_client,
     run_ssh_command,
+    run_ssh_command_result,
 )
 
 from helpers import (
@@ -49,6 +51,8 @@ SSH_KEY = os.getenv("SSH_KEY")
 
 COMMANDS_WHEN_LIMIT_HIT = os.getenv("COMMAND_LIMIT_HIT")
 COMMANDS_WHEN_LIMIT_REFRESHED = os.getenv("COMMAND_LIMIT_REFRESHED")
+COMMAND_LIMIT_STATUS = os.getenv("COMMAND_LIMIT_STATUS")
+COMMAND_LIMIT_STATUS_RUNNING_PATTERN = os.getenv("COMMAND_LIMIT_STATUS_RUNNING_PATTERN")
 
 SSH_CONFIGURED = bool(SSH_SERVER and SSH_USERNAME and SSH_KEY)
 
@@ -114,6 +118,9 @@ def write_state(state):
 BANDWIDTH_COMMANDS_RAN = False
 STORAGE_COMMANDS_RAN = False
 API_DOWN_COMMANDS_RAN = False
+# In server mode, Discord alerts for quota/traffic command failures are rate-limited.
+_STORAGE_UNAVAILABLE_LAST_ALERT_AT = None
+STORAGE_UNAVAILABLE_ALERT_INTERVAL_SECONDS = 3600
 _tracker_rules = []
 
 # ----------------------------------
@@ -165,32 +172,50 @@ def send_startup_state_message(state):
     else:
         color = Colors.LIME
 
+    fields = [
+        {
+            "name": "storage_commands_ran",
+            "value": str(state["storage_commands_ran"]),
+            "inline": True,
+        },
+        {
+            "name": "bandwidth_commands_ran",
+            "value": str(state["bandwidth_commands_ran"]),
+            "inline": True,
+        },
+        {
+            "name": "api_down_commands_ran",
+            "value": str(state["api_down_commands_ran"]),
+            "inline": True,
+        },
+        {
+            "name": "Autobrr recovery on boot",
+            "value": "Blocked (storage or bandwidth limit active)" if recovery_blocked else "Allowed",
+            "inline": False,
+        },
+    ]
+
+    if COMMAND_LIMIT_STATUS:
+        fields.append({
+            "name": "Live status check",
+            "value": (
+                f"`{COMMAND_LIMIT_STATUS}` — while a limit is active, the stop command "
+                "is re-run if this reports the app is up again (e.g. after a node reboot)."
+            ),
+            "inline": False,
+        })
+    else:
+        fields.append({
+            "name": "Live status check",
+            "value": "Disabled (set COMMAND_LIMIT_STATUS to verify the app is still stopped)",
+            "inline": False,
+        })
+
     send_discord_message(
         title="Script Started",
         description="Loaded persisted state from state.json.",
         color=color,
-        fields=[
-            {
-                "name": "storage_commands_ran",
-                "value": str(state["storage_commands_ran"]),
-                "inline": True,
-            },
-            {
-                "name": "bandwidth_commands_ran",
-                "value": str(state["bandwidth_commands_ran"]),
-                "inline": True,
-            },
-            {
-                "name": "api_down_commands_ran",
-                "value": str(state["api_down_commands_ran"]),
-                "inline": True,
-            },
-            {
-                "name": "Autobrr recovery on boot",
-                "value": "Blocked (storage or bandwidth limit active)" if recovery_blocked else "Allowed",
-                "inline": False,
-            },
-        ],
+        fields=fields,
     )
 
 
@@ -237,6 +262,11 @@ def warn_optional_config():
                 "COMMAND_LIMIT_REFRESHED is not set. No command will run when traffic or storage "
                 "recovers (AutoBRR will not be automatically restarted)."
             )
+        if not COMMAND_LIMIT_STATUS:
+            logger.warning(
+                "COMMAND_LIMIT_STATUS is not set. The script will trust state.json alone and will not "
+                "re-stop AutoBRR if it comes back up after a node reboot while a limit is still active."
+            )
     else:
         # SSH credentials
         ssh_vars_missing = [k for k, v in {"SSH_SERVER": SSH_SERVER, "SSH_USERNAME": SSH_USERNAME, "SSH_KEY": SSH_KEY}.items() if not v]
@@ -266,6 +296,11 @@ def warn_optional_config():
                 logger.warning(
                     "COMMAND_LIMIT_REFRESHED is not set. No SSH command will run when traffic or storage "
                     "recovers (AutoBRR will not be automatically restarted)."
+                )
+            if not COMMAND_LIMIT_STATUS:
+                logger.warning(
+                    "COMMAND_LIMIT_STATUS is not set. The script will trust state.json alone and will not "
+                    "re-stop AutoBRR if it comes back up after a node reboot while a limit is still active."
                 )
 
     # Discord — general webhook
@@ -313,26 +348,38 @@ def warn_optional_config():
 
 def validate_server_mode():
     """
-    Validates that the local system commands required by RUNNING_ON_SERVER mode are available.
-    Exits with a clear error if either command fails.
+    Checks that the local system commands required by RUNNING_ON_SERVER mode are available.
+
+    Does not exit on failure — quota/app-traffic can be briefly unavailable after a node
+    reboot. The main loop keeps retrying and rate-limits Discord alerts instead.
     """
     errors = []
 
-    result = subprocess.run(["quota", "-s"], capture_output=True, text=True, timeout=10)
-    if result.returncode != 0:
-        errors.append("'quota -s' failed — is quota installed and configured for this user?")
+    try:
+        result = subprocess.run(["quota", "-s"], capture_output=True, text=True, timeout=10)
+        if result.returncode != 0:
+            errors.append("'quota -s' failed — is quota installed and configured for this user?")
+    except Exception as e:
+        errors.append(f"'quota -s' could not be run: {e}")
 
-    result = subprocess.run(["app-traffic", "info"], capture_output=True, text=True, timeout=10)
-    if result.returncode != 0:
-        errors.append("'app-traffic info' failed — is this command available on your system?")
+    try:
+        result = subprocess.run(["app-traffic", "info"], capture_output=True, text=True, timeout=10)
+        if result.returncode != 0:
+            errors.append("'app-traffic info' failed — is this command available on your system?")
+    except Exception as e:
+        errors.append(f"'app-traffic info' could not be run: {e}")
 
     if errors:
-        logger.error("RUNNING_ON_SERVER=true is set but required system commands are not working:")
+        logger.warning(
+            "RUNNING_ON_SERVER=true is set but required system commands are not working yet. "
+            "The script will keep retrying without stopping the managed app:"
+        )
         for err in errors:
-            logger.error(f"  {err}")
-        sys.exit(1)
+            logger.warning(f"  {err}")
+        return False
 
     logger.info("Server mode validated: quota and app-traffic commands are available.")
+    return True
 
 
 def load_tracker_rules():
@@ -479,6 +526,154 @@ def run_limit_command(command):
             ssh_client.close()
 
 
+def _run_status_command(command):
+    """
+    Run a status command without exiting on failure.
+    Returns (exit_code, combined_output) or (None, error) if execution failed.
+    """
+    if not command:
+        return None, "No status command configured."
+
+    if RUNNING_ON_SERVER:
+        try:
+            result = subprocess.run(
+                command, shell=True, capture_output=True, text=True, timeout=30
+            )
+            output = "\n".join(
+                part for part in (result.stdout.strip(), result.stderr.strip()) if part
+            )
+            return result.returncode, output
+        except Exception as e:
+            logger.error(f"Error running status command {command!r}: {e}")
+            return None, str(e)
+
+    ssh_client = _get_ssh_client()
+    if not ssh_client:
+        return None, "SSH is not configured."
+    try:
+        exit_code, stdout, stderr = run_ssh_command_result(ssh_client, command)
+        output = "\n".join(part for part in (stdout.strip(), stderr.strip()) if part)
+        return exit_code, output
+    finally:
+        ssh_client.close()
+
+
+def is_limit_app_running():
+    """
+    Check whether the managed limit app (e.g. autobrr) is currently running.
+
+    Uses COMMAND_LIMIT_STATUS. By default, exit code 0 means running.
+    If COMMAND_LIMIT_STATUS_RUNNING_PATTERN is set, the app is considered
+    running only when that case-insensitive regex matches the command output.
+
+    Returns True/False, or None when the check is unavailable or fails.
+    """
+    if not COMMAND_LIMIT_STATUS:
+        return None
+
+    exit_code, output = _run_status_command(COMMAND_LIMIT_STATUS)
+    if exit_code is None:
+        logger.warning(
+            "Limit-app status check failed (%s): %s",
+            COMMAND_LIMIT_STATUS,
+            output or "unknown error",
+        )
+        return None
+
+    if COMMAND_LIMIT_STATUS_RUNNING_PATTERN:
+        try:
+            running = bool(
+                re.search(COMMAND_LIMIT_STATUS_RUNNING_PATTERN, output or "", re.IGNORECASE)
+            )
+        except re.error as e:
+            logger.error(
+                "Invalid COMMAND_LIMIT_STATUS_RUNNING_PATTERN %r: %s",
+                COMMAND_LIMIT_STATUS_RUNNING_PATTERN,
+                e,
+            )
+            return None
+        logger.info(
+            "Limit-app status check %r matched=%s (exit %s).",
+            COMMAND_LIMIT_STATUS,
+            running,
+            exit_code,
+        )
+        return running
+
+    running = exit_code == 0
+    logger.info(
+        "Limit-app status check %r running=%s (exit %s).",
+        COMMAND_LIMIT_STATUS,
+        running,
+        exit_code,
+    )
+    return running
+
+
+def limit_stop_required():
+    """True when any active limit requires the managed app to stay stopped."""
+    if STORAGE_COMMANDS_RAN or BANDWIDTH_COMMANDS_RAN:
+        return True
+    # Remote mode stops the app when the Ultra API is down. Server mode does not —
+    # it keeps retrying quota/traffic commands without stopping the managed app.
+    if API_DOWN_COMMANDS_RAN and not RUNNING_ON_SERVER:
+        return True
+    return False
+
+
+def ensure_limit_app_stopped():
+    """
+    While a limit is active, verify the managed app is still stopped.
+
+    After a node reboot the app may start again while state.json still says we
+    already ran the stop command. Re-run COMMAND_LIMIT_HIT when that happens.
+    """
+    if not limit_stop_required():
+        return False
+    if not COMMAND_LIMIT_STATUS:
+        return False
+    if not COMMANDS_WHEN_LIMIT_HIT:
+        return False
+
+    running = is_limit_app_running()
+    if running is None:
+        return False
+    if not running:
+        return False
+
+    reasons = []
+    if STORAGE_COMMANDS_RAN:
+        reasons.append("storage limit active")
+    if BANDWIDTH_COMMANDS_RAN:
+        reasons.append("bandwidth limit active")
+    if API_DOWN_COMMANDS_RAN:
+        reasons.append("storage/API unavailable")
+
+    logger.warning(
+        "Limit is active (%s) but status check reports the managed app is running "
+        "(e.g. after a node reboot). Re-running stop command.",
+        ", ".join(reasons),
+    )
+    run_limit_command(COMMANDS_WHEN_LIMIT_HIT)
+    send_discord_message(
+        title="Limit App Restarted Unexpectedly",
+        description=(
+            f"A limit is still active ({', '.join(reasons)}), but the managed app was "
+            f"found running again — for example after a node reboot. "
+            f"{_stop_description().capitalize()}."
+        ),
+        color=Colors.FUCHSIA,
+        fields=[
+            {
+                "name": "Status command",
+                "value": f"`{COMMAND_LIMIT_STATUS}`",
+                "inline": False,
+            },
+        ],
+    )
+    return True
+
+
 def autobrr_recovery_blocked():
     """True when storage or bandwidth limits require autobrr to stay stopped."""
     return STORAGE_COMMANDS_RAN or BANDWIDTH_COMMANDS_RAN
@@ -499,6 +694,99 @@ def maybe_run_recovery_command():
         return False
     run_limit_command(COMMANDS_WHEN_LIMIT_REFRESHED)
     return True
+
+
+def _server_storage_unavailable_should_alert(now=None):
+    """True when a server-mode storage-command outage Discord alert is due."""
+    global _STORAGE_UNAVAILABLE_LAST_ALERT_AT
+    now = time.time() if now is None else now
+    if _STORAGE_UNAVAILABLE_LAST_ALERT_AT is None:
+        return True
+    return (now - _STORAGE_UNAVAILABLE_LAST_ALERT_AT) >= STORAGE_UNAVAILABLE_ALERT_INTERVAL_SECONDS
+
+
+def handle_server_storage_unavailable():
+    """
+    Server mode: quota/traffic commands failed.
+
+    Keep retrying without stopping the managed app. Discord alerts at most once per hour
+    until the commands succeed again.
+    """
+    global API_DOWN_COMMANDS_RAN, _STORAGE_UNAVAILABLE_LAST_ALERT_AT
+
+    logger.warning(
+        "Storage data unavailable in server mode. Skipping storage/traffic actions this cycle; "
+        "will keep retrying without stopping the managed app."
+    )
+
+    if not API_DOWN_COMMANDS_RAN:
+        API_DOWN_COMMANDS_RAN = True
+        write_state({**read_state(), "api_down_commands_ran": True})
+
+    if not _server_storage_unavailable_should_alert():
+        return False
+
+    _STORAGE_UNAVAILABLE_LAST_ALERT_AT = time.time()
+    error_detail = get_storage_fetch_error()
+    if len(error_detail) > 990:
+        error_detail = error_detail[:987] + "..."
+
+    send_discord_message(
+        title="Storage Commands Unavailable",
+        description=(
+            "The local storage commands (quota / app-traffic) failed to return data. "
+            "The managed app was left running. The script will keep retrying each cycle and "
+            f"will send another alert at most once per hour until this is fixed."
+        ),
+        color=Colors.YELLOW,
+        fields=[{
+            "name": "Error details",
+            "value": f"```\n{error_detail}\n```",
+            "inline": False,
+        }],
+    )
+    return True
+
+
+def handle_storage_data_recovered():
+    """Clear the storage/API outage flag and notify; restart the app only when we stopped it."""
+    global API_DOWN_COMMANDS_RAN, _STORAGE_UNAVAILABLE_LAST_ALERT_AT
+
+    logger.info("Storage data recovered.")
+    API_DOWN_COMMANDS_RAN = False
+    _STORAGE_UNAVAILABLE_LAST_ALERT_AT = None
+    write_state({**read_state(), "api_down_commands_ran": False})
+
+    if RUNNING_ON_SERVER:
+        # Server mode never stopped the managed app for this outage.
+        send_discord_message(
+            title="Storage Commands Recovered",
+            description=(
+                "Local storage commands are returning data again. "
+                "Storage/traffic monitoring has resumed."
+            ),
+            color=Colors.LIME,
+        )
+        return
+
+    if maybe_run_recovery_command():
+        send_discord_message(
+            title="Ultra API Recovered",
+            description=(
+                f"The Ultra API is back online. {_start_description().capitalize()} "
+                "and storage/traffic monitoring has resumed."
+            ),
+            color=Colors.LIME,
+        )
+    else:
+        send_discord_message(
+            title="Ultra API Recovered",
+            description=(
+                "The Ultra API is back online. Monitoring has resumed, but autobrr "
+                "remains stopped because a storage or bandwidth limit is still active."
+            ),
+            color=Colors.LIME,
+        )
 
 
 # ----------------------------------
@@ -1076,53 +1364,16 @@ def _five_minute_job():
 
     logger.info("Running periodic checks...")
 
+    # Re-stop the managed app if a persisted limit is active but the app came
+    # back up (common after a seedbox/node reboot).
+    ensure_limit_app_stopped()
+
     qb_client = get_qbittorrent_client()
 
     storage_data = get_storage_data()
     if storage_data:
         if API_DOWN_COMMANDS_RAN:
-            logger.info("Storage data recovered.")
-            API_DOWN_COMMANDS_RAN = False
-            write_state({**read_state(), "api_down_commands_ran": False})
-            if maybe_run_recovery_command():
-                if RUNNING_ON_SERVER:
-                    send_discord_message(
-                        title="Storage Commands Recovered",
-                        description=(
-                            "Local storage commands are returning data again. "
-                            f"{_start_description().capitalize()} and storage/traffic monitoring has resumed."
-                        ),
-                        color=Colors.LIME
-                    )
-                else:
-                    send_discord_message(
-                        title="Ultra API Recovered",
-                        description=(
-                            f"The Ultra API is back online. {_start_description().capitalize()} "
-                            "and storage/traffic monitoring has resumed."
-                        ),
-                        color=Colors.LIME
-                    )
-            else:
-                if RUNNING_ON_SERVER:
-                    send_discord_message(
-                        title="Storage Commands Recovered",
-                        description=(
-                            "Local storage commands are returning data again. "
-                            "Monitoring has resumed, but autobrr remains stopped because "
-                            "a storage or bandwidth limit is still active."
-                        ),
-                        color=Colors.LIME
-                    )
-                else:
-                    send_discord_message(
-                        title="Ultra API Recovered",
-                        description=(
-                            "The Ultra API is back online. Monitoring has resumed, but autobrr "
-                            "remains stopped because a storage or bandwidth limit is still active."
-                        ),
-                        color=Colors.LIME
-                    )
+            handle_storage_data_recovered()
 
         free_storage_gb = storage_data["service_stats_info"]["free_storage_gb"]
 
@@ -1145,6 +1396,8 @@ def _five_minute_job():
                 description="Could not connect to qBittorrent. Storage-based cleanup and torrent management will be skipped this cycle.",
                 color=Colors.RED
             )
+    elif RUNNING_ON_SERVER:
+        handle_server_storage_unavailable()
     else:
         logger.warning("Storage data unavailable. Skipping storage-based cleanup this cycle.")
         logger.warning("Storage data unavailable. Running stop command to prevent quota overrun.")
@@ -1152,34 +1405,15 @@ def _five_minute_job():
         if not API_DOWN_COMMANDS_RAN:
             API_DOWN_COMMANDS_RAN = True
             write_state({**read_state(), "api_down_commands_ran": True})
-            if RUNNING_ON_SERVER:
-                error_detail = get_storage_fetch_error()
-                if len(error_detail) > 990:
-                    error_detail = error_detail[:987] + "..."
-                send_discord_message(
-                    title="Storage Commands Unavailable",
-                    description=(
-                        "The local storage commands (quota / app-traffic) failed to return data. "
-                        f"{_stop_description().capitalize()} as a precaution to prevent quota overrun. "
-                        "Will retry each cycle and run the recovery command automatically when the commands succeed again."
-                    ),
-                    color=Colors.RED,
-                    fields=[{
-                        "name": "Error details",
-                        "value": f"```\n{error_detail}\n```",
-                        "inline": False,
-                    }],
-                )
-            else:
-                send_discord_message(
-                    title="Ultra API Unreachable",
-                    description=(
-                        "The Ultra API (used to check storage and traffic usage) is not responding. "
-                        f"{_stop_description().capitalize()} as a precaution to prevent quota overrun. "
-                        "Will retry each cycle and run the recovery command automatically when the API comes back."
-                    ),
-                    color=Colors.RED
-                )
+            send_discord_message(
+                title="Ultra API Unreachable",
+                description=(
+                    "The Ultra API (used to check storage and traffic usage) is not responding. "
+                    f"{_stop_description().capitalize()} as a precaution to prevent quota overrun. "
+                    "Will retry each cycle and run the recovery command automatically when the API comes back."
+                ),
+                color=Colors.RED
+            )
 
     if qb_client:
         cleanup_unregistered_torrents(qb_client)

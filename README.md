@@ -2,6 +2,8 @@
 
 An automated qBittorrent cleanup daemon for [UltraSeedbox](https://ultra.cc/) that keeps your storage healthy by removing low-value torrents, clearing unregistered torrents, and enforcing tracker-specific seeding rules.
 
+See [CHANGELOG.md](CHANGELOG.md) for recent changes.
+
 Integrates with Discord for notifications and supports two deployment modes for storage and traffic monitoring:
 
 - **Remote mode** (default) — runs on any machine and connects to your seedbox via the Ultra API and SSH.
@@ -15,7 +17,7 @@ Integrates with Discord for notifications and supports two deployment modes for 
 - **Unregistered torrent cleanup** — detects torrents the tracker has marked as "unregistered" and removes them after a configurable inactivity period.
 - **Tracker-specific rules** — deletes torrents from specific trackers after their minimum seeding period has passed and they've been inactive for 24+ hours. Ships with rules for TorrentLeech and IPTorrents; fully configurable.
 - **Traffic limit handling** — monitors your monthly traffic usage and runs a configurable command when you approach the limit (e.g. stopping AutoBRR).
-- **API outage protection** — if the Ultra API becomes unreachable, the stop command is run automatically to prevent quota overrun. AutoBRR is restarted once the API recovers.
+- **API outage protection** — in remote mode, if the Ultra API becomes unreachable, the stop command is run automatically to prevent quota overrun. AutoBRR is restarted once the API recovers. In server mode, failed `quota` / `app-traffic` checks are retried without stopping the managed app, with Discord alerts at most once per hour.
 - **Storage mismatch alerts** — warns when your reported storage and qBittorrent's total diverge significantly (a sign of orphaned files).
 - **Orphaned folder cleanup** — on a configurable schedule, compares qBittorrent content folders to the seed directory and moves orphaned folders into a safe delete directory (restorable before manual emptying).
 - **Hourly Discord summary** — posts free storage, traffic status, and a table of the next torrents in line for deletion.
@@ -60,6 +62,8 @@ Edit `.env` with your values. At minimum you need the qBittorrent credentials. E
 python3 cleanup.py
 ```
 
+On Ultra.cc, prefer the [user systemd service](#running-as-a-systemd-service-ultracc) so the script survives SSH disconnects and node reboots without `screen`.
+
 ---
 
 ## Deployment modes
@@ -76,7 +80,7 @@ The script runs directly on the seedbox. Storage data is read from `quota -s` an
 
 **SSH and the Ultra API are not required.** If a limit command fails, the script exits immediately with an error — there is no silent fallback.
 
-On startup, the script validates that `quota` and `app-traffic` are accessible and exits with a clear error if either is not available.
+On startup, the script checks that `quota` and `app-traffic` are accessible. If they are temporarily unavailable (common right after a node reboot), the script **keeps running**, retries each cycle, leaves AutoBRR alone, and sends Discord alerts at most once per hour until the commands work again.
 
 ---
 
@@ -103,6 +107,8 @@ All configuration is via `.env`. See `.env.example` for the full list with descr
 | `SSH_STRICT_HOST_KEYS` | No | Set to `true` to reject unknown SSH host keys instead of auto-accepting them (default: `false`). See [SSH host key verification](#ssh-host-key-verification). |
 | `COMMAND_LIMIT_HIT` | No | Command to run when traffic/storage limit is hit. Executed over SSH in remote mode, locally in server mode. If unset, no command runs. |
 | `COMMAND_LIMIT_REFRESHED` | No | Command to run when traffic/storage recovers. Executed over SSH in remote mode, locally in server mode. If unset, no command runs. |
+| `COMMAND_LIMIT_STATUS` | No | Command that reports whether the managed app (e.g. AutoBRR) is running. While a limit is active, this is checked each cycle and `COMMAND_LIMIT_HIT` is re-run if the app is up again (e.g. after a node reboot). Exit code `0` means running unless a pattern is set. |
+| `COMMAND_LIMIT_STATUS_RUNNING_PATTERN` | No | Optional case-insensitive regex matched against status command output. When set, the app is considered running only if the pattern matches. |
 | `MIN_FREE_GB` | No | Minimum free GB before cleanup triggers (default: `300`) |
 | `MAX_DELETIONS_PER_RUN` | No | Max torrents deleted per cleanup pass (default: `5`) |
 | `STORAGE_MISMATCH_THRESHOLD_GB` | No | Gap in GB before a mismatch alert fires (default: `200`) |
@@ -126,6 +132,7 @@ The script will log a warning at startup for each disabled feature, so you know 
 | `SSH_SERVER` / `SSH_USERNAME` / `SSH_KEY` (remote mode only) | **AutoBRR will not be stopped when limits are hit.** AutoBRR is the app that automatically adds new torrents to qBittorrent — without SSH, it will keep adding torrents even when your storage is full or your monthly traffic quota is exhausted. This will cause your disk to fill completely, prevent upload credit from being earned, and may cause errors on your seedbox. Not required if `RUNNING_ON_SERVER=true`. |
 | `COMMAND_LIMIT_HIT` | No command runs when a limit is hit. |
 | `COMMAND_LIMIT_REFRESHED` | No command runs on recovery. |
+| `COMMAND_LIMIT_STATUS` | No live check that the managed app stayed stopped. After a node reboot AutoBRR may start again while `state.json` still says the stop command already ran. |
 | `DISCORD_WEBHOOK_URL` | No Discord notifications for deletions, storage alerts, errors, or hourly summaries. Everything still appears in the log. |
 | `INACTIVE_DISCORD_URL` | No Discord notifications specifically for tracker-inactive deletions. |
 | `UNREGISTERED_CHECK_ENABLED=false` | Torrents marked as unregistered by their tracker are left alone. |
@@ -202,34 +209,74 @@ After accepting the host key interactively, the script will connect without issu
 
 ---
 
-## Running as a systemd service
+## Running as a systemd service (Ultra.cc)
 
-Create `/etc/systemd/system/seedbox-torrent-manager.service`:
+On [Ultra.cc](https://ultra.cc/) you do **not** have root/`sudo`, and you should not use `screen` or `tmux` to keep the script alive. Use a **user** systemd unit instead — the same pattern Ultra documents for custom apps.
 
-```ini
-[Unit]
-Description=Seedbox Torrent Manager
-After=network.target
+A ready-made unit ships in [`deploy/seedbox-torrent-manager.service`](deploy/seedbox-torrent-manager.service).
 
-[Service]
-Type=simple
-User=YOUR_USER
-WorkingDirectory=/path/to/seedbox-torrent-manager
-ExecStart=/usr/bin/python3 /path/to/seedbox-torrent-manager/cleanup.py
-Restart=on-failure
-RestartSec=30
+### 1. Install dependencies in a virtualenv (recommended)
 
-[Install]
-WantedBy=multi-user.target
-```
-
-Then:
+From the repo directory on your slot:
 
 ```bash
-sudo systemctl daemon-reload
-sudo systemctl enable seedbox-torrent-manager
-sudo systemctl start seedbox-torrent-manager
+cd ~/seedbox-torrent-manager
+python3 -m venv .venv
+.venv/bin/pip install -r requirements.txt
+cp -n .env.example .env
+# edit .env — for Ultra slots set RUNNING_ON_SERVER=true
 ```
+
+### 2. Install the user unit
+
+```bash
+mkdir -p ~/.config/systemd/user
+cp ~/seedbox-torrent-manager/deploy/seedbox-torrent-manager.service \
+  ~/.config/systemd/user/seedbox-torrent-manager.service
+```
+
+Edit the unit if your clone path or Python path differs:
+
+```bash
+nano ~/.config/systemd/user/seedbox-torrent-manager.service
+```
+
+The shipped file assumes:
+
+- Repo at `~/seedbox-torrent-manager`
+- Interpreter at `~/seedbox-torrent-manager/.venv/bin/python`
+
+`%h` expands to your home directory. Do **not** set `User=` / `Group=` in a user unit.
+
+### 3. Enable and start
+
+Always use `systemctl --user` on Ultra.cc:
+
+```bash
+systemctl --user daemon-reload
+systemctl --user enable --now seedbox-torrent-manager.service
+systemctl --user status seedbox-torrent-manager.service
+```
+
+Useful commands:
+
+```bash
+systemctl --user restart seedbox-torrent-manager.service
+systemctl --user stop seedbox-torrent-manager.service
+journalctl --user -u seedbox-torrent-manager.service -f
+```
+
+Ultra.cc enables linger for your account, so the service keeps running after you disconnect SSH and comes back after a node reboot. Confirm with:
+
+```bash
+loginctl show-user "$(whoami)" | grep -i linger
+```
+
+If `Linger=no`, open a support ticket with Ultra.
+
+### Non-Ultra hosts (system-wide unit)
+
+On a VPS where you have root, you can instead install a system unit under `/etc/systemd/system/` (with `User=` / `WorkingDirectory=` / `ExecStart=` filled in) and use `sudo systemctl enable --now seedbox-torrent-manager`. Prefer the user-unit approach above on Ultra.cc.
 
 ---
 
@@ -247,9 +294,11 @@ The script persists a single `state.json` file in its working directory:
 
 - `bandwidth_commands_ran` — whether the stop command was executed in response to the traffic limit being hit
 - `storage_commands_ran` — whether the stop command was executed in response to storage dropping below the minimum
-- `api_down_commands_ran` — whether the stop command was executed in response to the Ultra API becoming unreachable (remote mode only)
+- `api_down_commands_ran` — remote mode: whether the stop command was executed because the Ultra API was unreachable. Server mode: whether local `quota` / `app-traffic` commands are currently failing (the managed app is **not** stopped for this)
 
 This is used to avoid re-running commands on every loop and to know when to send a "recovered" command. The file is created automatically and excluded from git.
+
+If `COMMAND_LIMIT_STATUS` is set, the script also verifies the managed app is still stopped whenever any of these flags is true. That covers the case where a seedbox/node reboot starts AutoBRR again while `state.json` still records that the stop command already ran — the stop command is re-executed automatically.
 
 ---
 
@@ -294,3 +343,5 @@ You can find your `BEARER_TOKEN` in the API configuration that was set up during
 ### SSH commands
 
 The default `COMMAND_LIMIT_HIT` and `COMMAND_LIMIT_REFRESHED` values use UltraSeedbox's `app-*` app-management commands (e.g. `app-autobrr stop`). These are available on UltraSeedbox regardless of whether you use remote or server mode. Adjust them to match whichever app you want to pause when your traffic or storage limit is hit.
+
+`COMMAND_LIMIT_STATUS` should match the same app. On UltraSeedbox a reliable check is `systemctl --user is-active --quiet autobrr` (exit `0` = running). Alternatives include `pgrep -x autobrr`, or a status command paired with `COMMAND_LIMIT_STATUS_RUNNING_PATTERN` when the tool always exits `0` and prints text like `running` / `stopped`.
