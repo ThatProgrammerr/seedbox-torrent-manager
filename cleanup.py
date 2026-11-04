@@ -89,6 +89,12 @@ UNREGISTERED_CHECK_ENABLED = os.getenv("UNREGISTERED_CHECK_ENABLED", "true").low
 UNREGISTERED_INACTIVE_HOURS = int(os.getenv("UNREGISTERED_INACTIVE_HOURS", 6))
 
 # ----------------------------------
+# Max torrent age cleanup (optional)
+# ----------------------------------
+MAX_TORRENT_AGE_ENABLED = os.getenv("MAX_TORRENT_AGE_ENABLED", "false").lower() == "true"
+MAX_TORRENT_AGE_DAYS = max(1, int(os.getenv("MAX_TORRENT_AGE_DAYS", 30)))
+
+# ----------------------------------
 # State persistence
 # ----------------------------------
 STATE_FILE = Path(__file__).parent / "state.json"
@@ -327,6 +333,19 @@ def warn_optional_config():
         logger.warning(
             "UNREGISTERED_CHECK_ENABLED is false. Torrents that trackers have marked as "
             "'unregistered' will not be automatically removed."
+        )
+
+    # Max torrent age cleanup
+    if MAX_TORRENT_AGE_ENABLED:
+        logger.info(
+            "MAX_TORRENT_AGE_ENABLED is true. Completed torrents with ratio ≥ 1.0 that have been "
+            f"in the client longer than {MAX_TORRENT_AGE_DAYS} day(s) will be removed to free "
+            "slots for newer torrents (keep category is still protected)."
+        )
+    else:
+        logger.info(
+            "MAX_TORRENT_AGE_ENABLED is false. Torrents will not be removed solely for age; "
+            f"set MAX_TORRENT_AGE_ENABLED=true to enforce a {MAX_TORRENT_AGE_DAYS}-day maximum."
         )
 
     # Orphan folder cleanup
@@ -1285,6 +1304,87 @@ def cleanup_inactive_tracker(qb_client, rule):
         )
 
 
+def cleanup_max_age_torrents(qb_client):
+    """
+    Optionally remove completed torrents that have been in the client too long.
+
+    Requires ratio ≥ 1.0. Does not replace storage / inactive / unregistered cleanup —
+    those still run independently. Torrents in the 'keep' category are skipped.
+    """
+    if not MAX_TORRENT_AGE_ENABLED:
+        return
+
+    max_age_seconds = MAX_TORRENT_AGE_DAYS * 86400
+    logger.info(
+        f"Checking for torrents older than {MAX_TORRENT_AGE_DAYS} day(s) "
+        "(ratio ≥ 1.0, completed, not in keep)..."
+    )
+
+    try:
+        torrents = qb_client.torrents_info()
+    except Exception as e:
+        logger.error(f"Failed to fetch torrent list for max-age cleanup: {e}")
+        return
+
+    skip_states = {
+        "downloading",
+        "stalledDL",
+        "metaDL",
+        "allocating",
+        "checkingDL",
+        "checkingUP",
+        "checkingResumeData",
+        "moving",
+        "uploading",
+    }
+
+    candidates = [
+        t for t in torrents
+        if t.ratio >= 1.0
+        and timestamp_seconds(t.added_on) >= max_age_seconds
+        and (t.category or "").lower() != "keep"
+        and (getattr(t, "progress", 1) or 0) >= 1
+        and (t.state or "").lower() not in skip_states
+    ]
+    candidates = sorted(candidates, key=lambda t: t.added_on)  # oldest first
+
+    deletions = 0
+    for torrent in candidates:
+        if deletions >= MAX_DELETIONS_PER_RUN:
+            logger.warning(
+                f"Reached max deletions per run ({MAX_DELETIONS_PER_RUN}) during max-age cleanup. "
+                "Remaining aged torrents will be reconsidered next cycle."
+            )
+            break
+
+        age_days = timestamp_seconds(torrent.added_on) / 86400
+        delete_torrent(qb_client, torrent, real_delete=True)
+        deletions += 1
+        logger.info(
+            f"Deleted (max age): {torrent.name} | age {age_days:.1f} days | "
+            f"ratio {torrent.ratio:.2f}"
+        )
+        send_discord_message(
+            title="Deleted Torrent (Max Age)",
+            description=f"Torrent: {torrent.name}",
+            color=Colors.OLIVE,
+            fields=[
+                {"name": "Size", "value": f"{torrent.size / (1024 ** 3):.2f} GB", "inline": True},
+                {"name": "Ratio", "value": f"{torrent.ratio:.2f}", "inline": True},
+                {"name": "Age", "value": f"{age_days:.1f} days", "inline": True},
+                {"name": "Limit", "value": f"{MAX_TORRENT_AGE_DAYS} days", "inline": True},
+                {"name": "Added On", "value": formatted_duration(torrent.added_on), "inline": True},
+                {"name": "Last Activity", "value": formatted_duration(torrent.last_activity), "inline": True},
+                {"name": "Category", "value": torrent.category or "None", "inline": True},
+                {
+                    "name": "Reason",
+                    "value": f"In client ≥ {MAX_TORRENT_AGE_DAYS} days with ratio ≥ 1.0",
+                    "inline": False,
+                },
+            ],
+        )
+
+
 def cleanup_unregistered_torrents(qb_client):
     if not UNREGISTERED_CHECK_ENABLED:
         return
@@ -1503,6 +1603,7 @@ def _five_minute_job():
         cleanup_unregistered_torrents(qb_client)
         for rule in _tracker_rules:
             cleanup_inactive_tracker(qb_client, rule)
+        cleanup_max_age_torrents(qb_client)
         save_torrent_files(qb_client)
     else:
         logger.warning("qBittorrent unreachable. Skipping torrent cleanup this cycle.")

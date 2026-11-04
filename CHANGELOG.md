@@ -12,6 +12,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Ultra.cc-compatible user systemd unit at `deploy/seedbox-torrent-manager.service`, with install/enable instructions in the README (no `screen` / `sudo` required).
 - Project changelog (`CHANGELOG.md`).
 - Incomplete-download reservation check: AutoBRR stop/recover and storage cleanup use **effective free** space (`quota free − Σ amount_left`), so unfinished torrents cannot overfill the quota while still downloading. Hourly Discord storage updates include reserved and effective free figures.
+- Optional max torrent age cleanup (`MAX_TORRENT_AGE_ENABLED`, `MAX_TORRENT_AGE_DAYS`, default 30 days, off by default): removes completed torrents with ratio ≥ 1.0 that have been in the client too long, freeing slots for newer torrents without replacing other cleanup paths.
 
 ### Changed
 

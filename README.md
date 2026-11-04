@@ -16,6 +16,7 @@ Integrates with Discord for notifications and supports two deployment modes for 
 - **Storage-based cleanup** — when effective free space drops below a threshold, deletes the oldest/least popular seeded torrents (ratio ≥ 1.0, inactive for 2+ hours) until space is recovered. Incomplete downloads count as reserved space (`effective_free = quota_free − Σ amount_left`), so AutoBRR is stopped before unfinished torrents can overfill the quota.
 - **Unregistered torrent cleanup** — detects torrents the tracker has marked as "unregistered" and removes them after a configurable inactivity period.
 - **Tracker-specific rules** — deletes torrents from specific trackers after their minimum seeding period has passed and they've been inactive for 24+ hours. Ships with rules for TorrentLeech and IPTorrents; fully configurable.
+- **Max torrent age cleanup** (optional, off by default) — removes completed torrents that have sat in the client longer than a configurable number of days (default 30), even at a healthy ratio, so older seeds do not permanently occupy slots needed by newer torrents. Still requires ratio ≥ 1.0; `keep` is protected.
 - **Traffic limit handling** — monitors your monthly traffic usage and runs a configurable command when you approach the limit (e.g. stopping AutoBRR).
 - **API outage protection** — in remote mode, if the Ultra API becomes unreachable, the stop command is run automatically to prevent quota overrun. AutoBRR is restarted once the API recovers. In server mode, failed `quota` / `app-traffic` checks are retried without stopping the managed app, with Discord alerts at most once per hour.
 - **Storage mismatch alerts** — warns when your reported storage and qBittorrent's total diverge significantly (a sign of orphaned files).
@@ -121,6 +122,8 @@ All configuration is via `.env`. See `.env.example` for the full list with descr
 | `ORPHAN_IGNORE_FOLDERS` | No | Comma-separated folder names to exclude from orphan moves |
 | `UNREGISTERED_CHECK_ENABLED` | No | Enable unregistered torrent cleanup (default: `true`) |
 | `UNREGISTERED_INACTIVE_HOURS` | No | Hours inactive before an unregistered torrent is deleted (default: `6`) |
+| `MAX_TORRENT_AGE_ENABLED` | No | Enable max-age cleanup for completed torrents (default: `false`) |
+| `MAX_TORRENT_AGE_DAYS` | No | Days a completed torrent (ratio ≥ 1.0) may stay in the client before age-based removal (default: `30`) |
 | `TIMEZONE` | No | IANA timezone for activity timestamps (default: `UTC`) |
 
 ### What happens when optional config is missing
@@ -136,6 +139,7 @@ The script will log a warning at startup for each disabled feature, so you know 
 | `DISCORD_WEBHOOK_URL` | No Discord notifications for deletions, storage alerts, errors, or hourly summaries. Everything still appears in the log. |
 | `INACTIVE_DISCORD_URL` | No Discord notifications specifically for tracker-inactive deletions. |
 | `UNREGISTERED_CHECK_ENABLED=false` | Torrents marked as unregistered by their tracker are left alone. |
+| `MAX_TORRENT_AGE_ENABLED=false` (default) | Torrents are not removed solely for age. |
 | `ORPHAN_CHECK_ENABLED=true` without `ORPHAN_REMOTE_PATH` | Orphan-folder checks are skipped because no seed path is configured. |
 
 ### Orphaned folder cleanup
